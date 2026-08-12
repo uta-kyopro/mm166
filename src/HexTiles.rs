@@ -50,7 +50,6 @@ struct Route {
     tiles: Vec<(usize, u8)>,
     length: usize,
     bonuses: usize,
-    rotations: i32,
 }
 
 #[derive(Clone)]
@@ -64,7 +63,14 @@ struct Node {
     bonuses: usize,
     rotations: i32,
     depth_sum: usize,
+    damaged: u128,
     seen: Vec<u64>,
+}
+
+struct DamageModel {
+    cell_masks: Vec<u128>,
+    contributions: Vec<i64>,
+    base: Stats,
 }
 
 struct Board {
@@ -161,6 +167,52 @@ impl Board {
         s.score = (s.matched as i64 * (s.total - self.M as i64 * s.moves as i64)).max(0);
         s
     }
+
+    fn damage_model(&self, orientation: &[u8]) -> DamageModel {
+        let mut cell_masks = vec![0u128; self.valid.len()];
+        let mut contributions = vec![0i64; self.pairs.len()];
+        for (id, pair) in self.pairs.iter().enumerate() {
+            let (end, len, bonuses) = self.trace(orientation, pair[0]);
+            if end != pair[1] { continue; }
+            contributions[id] = (len * (bonuses + 1)) as i64;
+            let (mut cell, mut enter) = self.exits[pair[0]];
+            for _ in 0..=3 * self.valid_count {
+                cell_masks[cell] |= 1u128 << id;
+                let out = paired_dir(orientation[cell], enter);
+                let Some((next, next_enter)) = self.next(cell, out) else { break; };
+                cell = next;
+                enter = next_enter;
+            }
+        }
+        DamageModel { cell_masks, contributions, base: self.evaluate(orientation) }
+    }
+
+    fn tester_safe(&self, orientation: &[u8]) -> bool {
+        let ports = self.valid.len() * 6;
+        let mut globally_seen = vec![false; ports];
+        for start in 0..ports {
+            if !self.valid[start / 6] || globally_seen[start] { continue; }
+            let mut local = std::collections::HashMap::new();
+            let mut state = start;
+            let mut step = 0usize;
+            loop {
+                if globally_seen[state] { break; }
+                if let Some(&began) = local.get(&state) {
+                    if step - began > 400 { return false; }
+                    break;
+                }
+                local.insert(state, step);
+                step += 1;
+                let cell = state / 6;
+                let enter = state % 6;
+                let out = paired_dir(orientation[cell], enter);
+                let Some((next, next_enter)) = self.next(cell, out) else { break; };
+                state = next * 6 + next_enter;
+            }
+            for state in local.keys() { globally_seen[*state] = true; }
+        }
+        true
+    }
 }
 
 fn bit_test(bits: &[u64], cell: usize) -> bool {
@@ -188,7 +240,22 @@ fn orientation_choices(board: &Board, fixed: &[i8], base: &[u8], cell: usize, en
     IntoIterator::into_iter(best).enumerate().filter_map(|(out, x)| x.map(|(o, c)| (out, o, c))).collect()
 }
 
-fn route_rank(board: &Board, node: &Node, target_cell: usize, width: usize, special: bool) -> i64 {
+fn damage_loss(model: &DamageModel, mut mask: u128) -> (usize, i64) {
+    let mut count = 0usize;
+    let mut total = 0i64;
+    while mask != 0 {
+        let id = mask.trailing_zeros() as usize;
+        mask &= mask - 1;
+        count += 1;
+        total += model.contributions[id];
+    }
+    (count, total)
+}
+
+fn route_rank(
+    board: &Board, node: &Node, target_cell: usize, width: usize, special: bool,
+    damage: Option<&DamageModel>,
+) -> i64 {
     let r = node.cell / board.W;
     let c = node.cell % board.W;
     let tr = target_cell / board.W;
@@ -196,8 +263,19 @@ fn route_rank(board: &Board, node: &Node, target_cell: usize, width: usize, spec
     let heuristic = (r.abs_diff(tr) + c.abs_diff(tc)) as i64;
     if special {
         // Length and bonuses reinforce one another. A small target heuristic keeps
-        // the beam capable of closing after taking a profitable detour.
-        180 * (node.length * (node.bonuses + 1)) as i64
+        // the beam capable of closing after taking a profitable detour.  Once the
+        // perimeter has been secured, depth is useful: it steers the reserved pair
+        // through a gate into otherwise unused interior tiles.
+        let intrinsic = (node.length * (node.bonuses + 1)) as i64;
+        let predicted_gain = if let Some(model) = damage {
+            let (lost_k, lost_t) = damage_loss(model, node.damaged);
+            let old_q = model.base.total - board.M as i64 * model.base.moves as i64;
+            let new_k = model.base.matched.saturating_sub(lost_k) + 1;
+            let delta_k = new_k as i64 - model.base.matched as i64;
+            let delta_q = intrinsic - lost_t - board.M as i64 * node.rotations as i64;
+            delta_k * old_q + new_k as i64 * delta_q
+        } else { 0 };
+        (if damage.is_some() { 40 * predicted_gain + 80 * intrinsic } else { 180 * intrinsic })
             - 12 * board.M as i64 * node.rotations as i64
             - 5 * heuristic
             - node.depth_sum as i64
@@ -221,7 +299,7 @@ fn reconstruct(arena: &[Node], mut id: usize) -> Route {
         id = n.parent;
     }
     tiles.reverse();
-    Route { tiles, length: last.length, bonuses: last.bonuses, rotations: last.rotations }
+    Route { tiles, length: last.length, bonuses: last.bonuses }
 }
 
 fn find_route(
@@ -232,6 +310,7 @@ fn find_route(
     target: usize,
     width: usize,
     special: bool,
+    damage: Option<&DamageModel>,
     deadline: Instant,
 ) -> Option<Route> {
     if Instant::now() >= deadline { return None; }
@@ -242,6 +321,7 @@ fn find_route(
         cell: start_cell, enter: start_side, placed_cell: usize::MAX,
         parent: usize::MAX, orientation: 255,
         length: 0, bonuses: 0, rotations: 0, depth_sum: 0, seen: vec![0; words],
+        damaged: 0,
     };
     let mut arena = vec![root];
     let mut beam = vec![0usize];
@@ -268,6 +348,9 @@ fn find_route(
                     bonuses: p.bonuses + board.bonus[p.cell] as usize,
                     rotations: p.rotations + rotation_cost(board.initial[p.cell], o),
                     depth_sum: p.depth_sum + board.boundary_depth[p.cell],
+                    damaged: p.damaged | if o != base[p.cell] {
+                        damage.map_or(0, |m| m.cell_masks[p.cell])
+                    } else { 0 },
                     seen,
                 };
                 if let Some((nc, ne)) = board.next(p.cell, out) {
@@ -296,7 +379,9 @@ fn find_route(
                 }
             }
         }
-        next_beam.sort_unstable_by_key(|&id| Reverse(route_rank(board, &arena[id], target_cell, width, special)));
+        next_beam.sort_unstable_by_key(|&id| Reverse(route_rank(
+            board, &arena[id], target_cell, width, special, damage,
+        )));
         next_beam.truncate(beam_width);
         beam = next_beam;
         if !special && !goals.is_empty() { break; }
@@ -321,17 +406,27 @@ fn pair_priority(board: &Board, pair: [usize; 2]) -> usize {
     ar.abs_diff(br) + ac.abs_diff(bc)
 }
 
-fn build_outer(board: &Board, width: usize, deadline: Instant) -> Vec<u8> {
+fn build_outer(
+    board: &Board,
+    width: usize,
+    reserved: &[usize],
+    deadline: Instant,
+) -> (Vec<u8>, Vec<i8>) {
     let mut orientation = board.initial.clone();
     let mut fixed = vec![-1i8; orientation.len()];
     let mut best = orientation.clone();
+    let mut best_fixed = fixed.clone();
     let mut best_stats = board.evaluate(&best);
-    let mut order: Vec<usize> = (0..board.pairs.len()).collect();
+    let mut order: Vec<usize> = (0..board.pairs.len())
+        .filter(|i| !reserved.contains(i))
+        .collect();
     order.sort_unstable_by_key(|&i| pair_priority(board, board.pairs[i]));
     for i in order {
         if Instant::now() >= deadline { break; }
         let pair = board.pairs[i];
-        if let Some(route) = find_route(board, &orientation, &fixed, pair[0], pair[1], width, false, deadline) {
+        if let Some(route) = find_route(
+            board, &orientation, &fixed, pair[0], pair[1], width, false, None, deadline,
+        ) {
             apply_route(&mut orientation, &mut fixed, &route, true);
             let stats = board.evaluate(&orientation);
             if (stats.score, stats.matched, stats.total - board.M as i64 * stats.moves as i64)
@@ -339,10 +434,11 @@ fn build_outer(board: &Board, width: usize, deadline: Instant) -> Vec<u8> {
             {
                 best_stats = stats;
                 best = orientation.clone();
+                best_fixed = fixed.clone();
             }
         }
     }
-    best
+    (best, best_fixed)
 }
 
 fn special_order(board: &Board) -> Vec<usize> {
@@ -352,42 +448,65 @@ fn special_order(board: &Board) -> Vec<usize> {
     ids
 }
 
-fn build_with_specials(
-    board: &Board,
-    outer: &[u8],
-    width: usize,
-    special_ids: &[usize],
-    count: usize,
-    deadline: Instant,
-) -> (Vec<u8>, i64, usize) {
-    let mut orientation = outer.to_vec();
-    let mut fixed = vec![-1i8; orientation.len()];
-    let mut chosen: Vec<usize> = Vec::new();
-    let mut special_value = 0i64;
-    let mut special_done = 0usize;
-    for _ in 0..count.min(special_ids.len()) {
-        let mut pick: Option<(i64, i64, usize, Route)> = None;
-        for &id in special_ids {
-            if chosen.contains(&id) || Instant::now() >= deadline { continue; }
-            let p = board.pairs[id];
-            if let Some(route) = find_route(board, &orientation, &fixed, p[0], p[1], width, true, deadline) {
-                let mut trial = orientation.clone();
-                let mut ignored = fixed.clone();
-                apply_route(&mut trial, &mut ignored, &route, false);
-                let stats = board.evaluate(&trial);
-                let q = stats.total - board.M as i64 * stats.moves as i64;
-                let intrinsic = (route.length * (route.bonuses + 1)) as i64
-                    - board.M as i64 * route.rotations as i64;
-                if pick.as_ref().map_or(true, |x| (q, intrinsic) > (x.0, x.1)) {
-                    pick = Some((q, intrinsic, id, route));
+fn open_reserved_gates(board: &Board, fixed: &mut [i8], chosen: &[usize], width: usize) {
+    let mut dist = vec![usize::MAX; board.valid.len()];
+    let mut q = VecDeque::new();
+    for &id in chosen {
+        for &exit in &board.pairs[id] {
+            let cell = board.exits[exit].0;
+            if dist[cell] != 0 {
+                dist[cell] = 0;
+                q.push_back(cell);
+            }
+        }
+    }
+    // A small open patch around each reserved endpoint is the gate.  Normal paths
+    // outside it remain protected; paths crossing the patch may be repaired later.
+    let radius = width + 1;
+    while let Some(cell) = q.pop_front() {
+        fixed[cell] = -1;
+        if dist[cell] == radius { continue; }
+        for d in 0..6 {
+            if let Some((next, _)) = board.next(cell, d) {
+                if dist[next] == usize::MAX {
+                    dist[next] = dist[cell] + 1;
+                    q.push_back(next);
                 }
             }
         }
-        let Some((_, _, id, route)) = pick else { break; };
-        chosen.push(id);
-        special_value += (route.length * (route.bonuses + 1)) as i64;
-        special_done += 1;
-        apply_route(&mut orientation, &mut fixed, &route, true);
+    }
+}
+
+fn build_with_specials(
+    board: &Board,
+    outer: &[u8],
+    outer_fixed: &[i8],
+    width: usize,
+    chosen: &[usize],
+    deadline: Instant,
+) -> (Vec<u8>, i64, usize) {
+    let mut orientation = outer.to_vec();
+    let mut fixed = outer_fixed.to_vec();
+    for cell in 0..fixed.len() {
+        if board.valid[cell] && board.boundary_depth[cell] > width {
+            fixed[cell] = -1;
+        }
+    }
+    open_reserved_gates(board, &mut fixed, chosen, width);
+    let mut special_value = 0i64;
+    let mut special_done = 0usize;
+    for &id in chosen {
+        if Instant::now() >= deadline { break; }
+        let p = board.pairs[id];
+        let use_damage_dp = (board.W + 1) / 2 >= 16 && board.M <= 2;
+        let damage = use_damage_dp.then(|| board.damage_model(&orientation));
+        if let Some(route) = find_route(
+            board, &orientation, &fixed, p[0], p[1], width, true, damage.as_ref(), deadline,
+        ) {
+            special_value += (route.length * (route.bonuses + 1)) as i64;
+            special_done += 1;
+            apply_route(&mut orientation, &mut fixed, &route, true);
+        }
     }
     let mut best_orientation = orientation.clone();
     let mut best_stats = board.evaluate(&orientation);
@@ -398,7 +517,9 @@ fn build_with_specials(
     for id in order {
         if Instant::now() >= deadline { break; }
         let p = board.pairs[id];
-        if let Some(route) = find_route(board, &orientation, &fixed, p[0], p[1], width, false, deadline) {
+        if let Some(route) = find_route(
+            board, &orientation, &fixed, p[0], p[1], width, false, None, deadline,
+        ) {
             apply_route(&mut orientation, &mut fixed, &route, true);
             let stats = board.evaluate(&orientation);
             let q = stats.total - board.M as i64 * stats.moves as i64;
@@ -475,6 +596,7 @@ fn search_rotations(board: &Board, orientation: &mut Vec<u8>, start: Instant, de
             current_stats = next;
             if (next.score, next.matched, next.total, Reverse(next.moves))
                 > (best_stats.score, best_stats.matched, best_stats.total, Reverse(best_stats.moves))
+                && board.tester_safe(&current)
             {
                 best_stats = next;
                 best.clone_from(&current);
@@ -577,26 +699,36 @@ fn main() {
 
     for &width in &WIDTHS {
         if Instant::now() >= deadline { break; }
-        // Reserve roughly equal time for remaining widths; every special count uses
-        // this same outer connector, making the requested 0/1/2/3 comparison direct.
+        // Baseline with no reserved gate.
         let outer_deadline = Instant::now() + Duration::from_millis(1500);
-        let outer = build_outer(&board, width, outer_deadline.min(deadline));
+        let (outer, _) = build_outer(&board, width, &[], outer_deadline.min(deadline));
         let outer_stats = board.evaluate(&outer);
         eprintln!("config width={} special=0 done=0 special_t=0 k={} t={} m={} score={}",
             width, outer_stats.matched, outer_stats.total, outer_stats.moves, outer_stats.score);
-        if outer_stats.score > best_stats.score { best_stats = outer_stats; best_orientation = outer.clone(); }
+        if outer_stats.score > best_stats.score && board.tester_safe(&outer) {
+            best_stats = outer_stats;
+            best_orientation = outer.clone();
+        }
         for count in 1..=MAX_SPECIAL {
             if Instant::now() >= deadline { break; }
-            let per_config = Instant::now() + Duration::from_millis(700);
+            let chosen = &specials[..count.min(specials.len())];
+            // Rebuild the perimeter while deliberately leaving the chosen exits
+            // open.  The returned fixed mask is the set of secured short paths.
+            let outer_config_deadline = (Instant::now() + Duration::from_millis(450)).min(deadline);
+            let (gated_outer, gated_fixed) =
+                build_outer(&board, width, chosen, outer_config_deadline);
+            let gated_stats = board.evaluate(&gated_outer);
+            let per_config = Instant::now() + Duration::from_millis(550);
             let (mut candidate, special_t, done) = build_with_specials(
-                &board, &outer, width, &specials, count, per_config.min(deadline));
+                &board, &gated_outer, &gated_fixed, width, chosen, per_config.min(deadline));
             let polish_deadline = (Instant::now() + Duration::from_millis(90)).min(deadline);
             polish(&board, &mut candidate, polish_deadline);
             let stats = board.evaluate(&candidate);
-            let destroyed = outer_stats.matched.saturating_sub(stats.matched);
-            eprintln!("config width={} special={} done={} special_t={} destroyed={} k={} t={} m={} score={}",
-                width, count, done, special_t, destroyed, stats.matched, stats.total, stats.moves, stats.score);
-            if stats.score > best_stats.score {
+            let destroyed = gated_stats.matched.saturating_sub(stats.matched);
+            eprintln!("gated width={} reserved={} done={} gate_k={} special_t={} destroyed={} k={} t={} m={} score={}",
+                width, count, done, gated_stats.matched, special_t, destroyed,
+                stats.matched, stats.total, stats.moves, stats.score);
+            if stats.score > best_stats.score && board.tester_safe(&candidate) {
                 best_stats = stats;
                 best_orientation = candidate;
             }
