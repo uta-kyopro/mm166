@@ -1,11 +1,15 @@
 # AGENTS.md 追記案：評価・テスト手順
 
+## 基本方針
+- `problem.md`、`../knowledge`、関連する `../reference/<method>/*` を確認する。参照不能なら明示する。
+- 固定値・調整値は先頭付近へまとめ、解析情報は標準エラーへ出力する。
+- ヒューリスティックな着想・制約・観察結果は、再利用できる要点だけを端的な文章で `idea.md` に追記する。
+
 ## 評価方針
 
 - コード変更後は、まず **seed 1〜10** のみで評価する。
 - 評価指標は raw score の平均ではなく、各 seed の `log10(score)` の平均とする。
-- seed 1〜10 で現行版より改善傾向が確認できた場合のみ、**seed 1〜100** を実行する。
-- 明確に悪化した変更については、原則として seed 1〜100 まで拡張しない。
+- **seed 1〜100 は、ユーザーから明示的に指示された場合だけ実行する。** seed 1〜10 で改善していても、自動的に100 seedへ拡張しない。
 - `bests.txt` は削除・初期化せず、tester の `-bests` を常に指定して seed ごとの過去最高値を保持する。
 - 各評価結果は `scores/` 以下へ保存する。
 - 評価終了後は、最新コードの最終盤面を可視化し、`png/<seed:04>_<score>.png` として残す（例: seed 1、score 0 は `png/0001_0.png`）。
@@ -46,9 +50,9 @@ java -jar tester\tester.jar `
 python -c "import math; xs=[float(l.split('=',1)[1]) for l in open(r'scores\latest10.txt') if l.strip()]; print('mean_log10 =', '-inf' if any(x<=0 for x in xs) else sum(math.log10(x) for x in xs)/len(xs))"
 ```
 
-## 有望な変更のみ：seed 1〜100
+## 明示指示がある場合のみ：seed 1〜100
 
-seed 1〜10 で改善傾向が確認できた場合のみ実行する。
+ユーザーからseed 1〜100の評価を明示的に指示された場合だけ実行する。seed 1〜10で改善傾向が確認できても、この評価を自動では実行しない。
 
 ```powershell
 java -jar tester\tester.jar `
@@ -134,12 +138,11 @@ Remove-Item $visDir -Recurse -Force
 2. `rustc -O` でコンパイルする。
 3. seed 1〜10 を実行する。
 4. `mean_log10` を現行版と比較する。
-5. 改善傾向がなければ、その変更の100 seed評価は行わない。
-6. 改善傾向がある場合のみ seed 1〜100 を実行する。
-7. `mean_log10` と seed ごとの差を確認して採否を決める。
-8. 最後に評価したseed集合を1回のtester起動で可視化し、各最終盤面PNGを `png/<seed:04>_<score>.png` に更新する。同じseedの古いPNGは残さない。
-9. `bests.txt` は常に維持し、過去最高値を失わない。
-10. 採用する最新の `src/HexTiles.rs` から提出用 `HexTiles.rs.zip` を再生成する。
+5. seed 1〜100は、ユーザーから明示的な指示がある場合だけ実行する。改善していても自動的に拡張しない。
+6. `mean_log10` と seed ごとの差を確認して採否を決める。
+7. 最後に評価したseed集合を1回のtester起動で可視化し、各最終盤面PNGを `png/<seed:04>_<score>.png` に更新する。同じseedの古いPNGは残さない。
+8. `bests.txt` は常に維持し、過去最高値を失わない。
+9. 採用する最新の `src/HexTiles.rs` から提出用 `HexTiles.rs.zip` を再生成する。
 
 ## 提出用ZIP
 
@@ -166,9 +169,10 @@ Gitへcommit・pushする対象は以下に限定する。
 - `png/` 以下の全ファイル
 - `bests.txt`
 - `AGENTS.md`
+- `idea.md`
 - `doc/` 以下の全ファイル
 
-通常のソルバー改善で差分が発生するのは、原則として `HexTiles.rs.zip`、`png/` 以下、`bests.txt` のみとする。評価手順を変更した場合は `AGENTS.md`、資料を変更した場合は `doc/` も差分に含める。
+通常のソルバー改善で差分が発生するのは、原則として `HexTiles.rs.zip`、`png/` 以下、`bests.txt` のみとする。評価手順を変更した場合は `AGENTS.md`、アイデアを追加・変更した場合は `idea.md`、資料を変更した場合は `doc/` も差分に含める。
 
 `src/`、`scores/`、`tester/`、`HexTiles.exe`、`HexTiles.pdb` は作業・評価用であり、明示的な指示がない限りcommit・pushしない。`git add .` は使用せず、対象パスを明示してstageする。
 
