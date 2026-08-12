@@ -8,6 +8,7 @@
 ## 評価方針
 
 - コード変更後は、まず **seed 1〜10** のみで評価する。
+- 提出ソルバーは10秒制限を守る。探索周回数は固定せず経過時間で決め、出力処理の余裕を残して停止する。
 - 評価指標は raw score の平均ではなく、各 seed の `log10(score)` の平均とする。
 - **seed 1〜100 は、ユーザーから明示的に指示された場合だけ実行する。** seed 1〜10 で改善していても、自動的に100 seedへ拡張しない。
 - `bests.txt` は削除・初期化せず、tester の `-bests` を常に指定して seed ごとの過去最高値を保持する。
@@ -166,15 +167,16 @@ tar -tf HexTiles.rs.zip
 Gitへcommit・pushする対象は以下に限定する。
 
 - 提出可能な `HexTiles.rs.zip`
+- `src/` 以下の全ファイル
 - `png/` 以下の全ファイル
 - `bests.txt`
 - `AGENTS.md`
 - `idea.md`
 - `doc/` 以下の全ファイル
 
-通常のソルバー改善で差分が発生するのは、原則として `HexTiles.rs.zip`、`png/` 以下、`bests.txt` のみとする。評価手順を変更した場合は `AGENTS.md`、アイデアを追加・変更した場合は `idea.md`、資料を変更した場合は `doc/` も差分に含める。
+通常のソルバー改善で差分が発生するのは、原則として `src/` 以下、`HexTiles.rs.zip`、`png/` 以下、`bests.txt` とする。評価手順を変更した場合は `AGENTS.md`、アイデアを追加・変更した場合は `idea.md`、資料を変更した場合は `doc/` も差分に含める。
 
-`src/`、`scores/`、`tester/`、`HexTiles.exe`、`HexTiles.pdb` は作業・評価用であり、明示的な指示がない限りcommit・pushしない。`git add .` は使用せず、対象パスを明示してstageする。
+`scores/`、`tester/`、`HexTiles.exe`、`HexTiles.pdb` は作業・評価用であり、明示的な指示がない限りcommit・pushしない。`git add .` は使用せず、対象パスを明示してstageする。
 
 commit前に以下を確認し、対象外のファイルがstageされていないことを確認する。
 
