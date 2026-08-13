@@ -1,7 +1,7 @@
 #![allow(non_snake_case)]
 
 use std::cmp::Reverse;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -24,6 +24,7 @@ const RESTORE_REPAIR_BUDGET_MS: u64 = 5;
 const SA_START_TEMP: f64 = 240.0;
 const SA_END_TEMP: f64 = 1.0;
 const PATH_CONCENTRATION_WEIGHT: f64 = 0.01;
+const POSTPROCESS_LIMIT_MS: u64 = 450;
 
 struct Scanner {
     input: io::Stdin,
@@ -1312,6 +1313,238 @@ fn search_rotations(board: &Board, orientation: &mut Vec<u8>, start: Instant, de
         best_stats.score);
 }
 
+fn region_signature(board: &Board, cells: &[usize], local: &[u8]) -> Vec<u8> {
+    let mut boundary = Vec::with_capacity(12);
+    for i in 0..cells.len() {
+        for side in 0..6 {
+            let inside = board.next(cells[i], side)
+                .is_some_and(|(next, _)| cells.contains(&next));
+            if !inside { boundary.push((i, side)); }
+        }
+    }
+    let mut signature = Vec::with_capacity(boundary.len());
+    for &(start_cell, start_side) in &boundary {
+        let mut cell = start_cell;
+        let mut enter = start_side;
+        let mut result = u8::MAX;
+        for _ in 0..=3 * cells.len() {
+            let out = paired_dir(local[cell], enter);
+            if let Some((next, next_enter)) = board.next(cells[cell], out) {
+                if let Some(next_local) = cells.iter().position(|&x| x == next) {
+                    cell = next_local;
+                    enter = next_enter;
+                    continue;
+                }
+            }
+            result = boundary.iter().position(|&(i, side)| i == cell && side == out)
+                .unwrap() as u8;
+            break;
+        }
+        signature.push(result);
+    }
+    signature
+}
+
+fn reduce_rotations_by_triangles(
+    board: &Board, orientation: &mut Vec<u8>, deadline: Instant,
+) -> usize {
+    let mut triangles = Vec::new();
+    for a in 0..board.valid.len() {
+        if !board.valid[a] { continue; }
+        for side in 0..6 {
+            let Some((b, _)) = board.next(a, side) else { continue; };
+            let Some((c, _)) = board.next(a, (side + 1) % 6) else { continue; };
+            if !(0..6).any(|d| board.next(b, d).is_some_and(|x| x.0 == c)) { continue; }
+            let mut tri = [a, b, c];
+            tri.sort_unstable();
+            triangles.push(tri);
+        }
+    }
+    triangles.sort_unstable();
+    triangles.dedup();
+
+    let mut stats = board.evaluate(orientation);
+    let initial_moves = stats.moves;
+    let initial_total = stats.total;
+    let initial_score = stats.score;
+    let mut accepted = 0usize;
+    loop {
+        let mut changed = false;
+        for cells in &triangles {
+            if Instant::now() >= deadline {
+                eprintln!("triangle_post accepted={} rotations_saved={} total_delta={} score_delta={}",
+                    accepted, initial_moves - stats.moves, stats.total - initial_total,
+                    stats.score - initial_score);
+                return accepted;
+            }
+            let current = [orientation[cells[0]], orientation[cells[1]], orientation[cells[2]]];
+            let signature = region_signature(board, cells, &current);
+            let old_local_moves: i32 = cells.iter().map(|&cell| {
+                rotation_cost(board.initial[cell], orientation[cell])
+            }).sum();
+            let mut best: Option<(Stats, [u8; 3])> = None;
+            for code in 0..216usize {
+                let local = [
+                    (code % 6) as u8,
+                    (code / 6 % 6) as u8,
+                    (code / 36) as u8,
+                ];
+                let local_moves: i32 = (0..3).map(|i| {
+                    rotation_cost(board.initial[cells[i]], local[i])
+                }).sum();
+                if local_moves >= old_local_moves
+                    || region_signature(board, cells, &local) != signature
+                {
+                    continue;
+                }
+                for i in 0..3 { orientation[cells[i]] = local[i]; }
+                let candidate = board.evaluate(orientation);
+                if candidate.matched == stats.matched
+                    && candidate.score > stats.score
+                    && best.as_ref().map_or(true, |x| {
+                    (candidate.score, candidate.total, Reverse(candidate.moves))
+                        > (x.0.score, x.0.total, Reverse(x.0.moves))
+                }) {
+                    best = Some((candidate, local));
+                }
+                for i in 0..3 { orientation[cells[i]] = current[i]; }
+            }
+            if let Some((next, local)) = best {
+                for i in 0..3 { orientation[cells[i]] = local[i]; }
+                stats = next;
+                accepted += 1;
+                changed = true;
+            }
+        }
+        if !changed { break; }
+    }
+    eprintln!("triangle_post accepted={} rotations_saved={} total_delta={} score_delta={}",
+        accepted, initial_moves - stats.moves, stats.total - initial_total,
+        stats.score - initial_score);
+    accepted
+}
+
+fn rhombus_geometry(board: &Board, cells: &[usize; 4]) -> Vec<i8> {
+    let mut geometry = vec![-1; 24];
+    for i in 0..4 {
+        for side in 0..6 {
+            if let Some((next, _)) = board.next(cells[i], side) {
+                if let Some(j) = cells.iter().position(|&cell| cell == next) {
+                    geometry[i * 6 + side] = j as i8;
+                }
+            }
+        }
+    }
+    geometry
+}
+
+fn rhombus_equivalence_table(board: &Board, cells: &[usize; 4]) -> Vec<Vec<u16>> {
+    let mut groups: HashMap<Vec<u8>, Vec<u16>> = HashMap::new();
+    for code in 0..1296usize {
+        let local = [
+            (code % 6) as u8,
+            (code / 6 % 6) as u8,
+            (code / 36 % 6) as u8,
+            (code / 216) as u8,
+        ];
+        groups.entry(region_signature(board, cells, &local))
+            .or_default().push(code as u16);
+    }
+    let mut table = vec![Vec::new(); 1296];
+    for group in groups.into_values() {
+        for &code in &group { table[code as usize] = group.clone(); }
+    }
+    table
+}
+
+fn reduce_rotations_by_rhombi(
+    board: &Board, orientation: &mut Vec<u8>, deadline: Instant,
+) -> usize {
+    let mut rhombi = Vec::new();
+    for a in 0..board.valid.len() {
+        if !board.valid[a] { continue; }
+        for side in 0..6 {
+            let Some((b, _)) = board.next(a, side) else { continue; };
+            let Some((c, _)) = board.next(a, (side + 1) % 6) else { continue; };
+            let Some((d, _)) = board.next(b, (side + 1) % 6) else { continue; };
+            if !board.next(c, side).is_some_and(|x| x.0 == d) { continue; }
+            let mut cells = [a, b, c, d];
+            cells.sort_unstable();
+            rhombi.push(cells);
+        }
+    }
+    rhombi.sort_unstable();
+    rhombi.dedup();
+
+    let mut tables: HashMap<Vec<i8>, Vec<Vec<u16>>> = HashMap::new();
+    let mut stats = board.evaluate(orientation);
+    let initial_moves = stats.moves;
+    let initial_total = stats.total;
+    let initial_score = stats.score;
+    let mut accepted = 0usize;
+    loop {
+        let mut changed = false;
+        for cells in &rhombi {
+            if Instant::now() >= deadline {
+                eprintln!("rhombus_post accepted={} rotations_saved={} total_delta={} score_delta={} tables={}",
+                    accepted, initial_moves - stats.moves, stats.total - initial_total,
+                    stats.score - initial_score, tables.len());
+                return accepted;
+            }
+            let geometry = rhombus_geometry(board, cells);
+            if !tables.contains_key(&geometry) {
+                tables.insert(geometry.clone(), rhombus_equivalence_table(board, cells));
+            }
+            let current = [orientation[cells[0]], orientation[cells[1]],
+                orientation[cells[2]], orientation[cells[3]]];
+            let current_code = current[0] as usize
+                + 6 * current[1] as usize
+                + 36 * current[2] as usize
+                + 216 * current[3] as usize;
+            let old_local_moves: i32 = cells.iter().map(|&cell| {
+                rotation_cost(board.initial[cell], orientation[cell])
+            }).sum();
+            let mut best: Option<(Stats, [u8; 4])> = None;
+            for &code in &tables[&geometry][current_code] {
+                let code = code as usize;
+                let local = [
+                    (code % 6) as u8,
+                    (code / 6 % 6) as u8,
+                    (code / 36 % 6) as u8,
+                    (code / 216) as u8,
+                ];
+                let local_moves: i32 = (0..4).map(|i| {
+                    rotation_cost(board.initial[cells[i]], local[i])
+                }).sum();
+                if local_moves >= old_local_moves { continue; }
+                for i in 0..4 { orientation[cells[i]] = local[i]; }
+                let candidate = board.evaluate(orientation);
+                if candidate.matched == stats.matched
+                    && candidate.score > stats.score
+                    && best.as_ref().map_or(true, |x| {
+                        (candidate.score, candidate.total, Reverse(candidate.moves))
+                            > (x.0.score, x.0.total, Reverse(x.0.moves))
+                    })
+                {
+                    best = Some((candidate, local));
+                }
+                for i in 0..4 { orientation[cells[i]] = current[i]; }
+            }
+            if let Some((next, local)) = best {
+                for i in 0..4 { orientation[cells[i]] = local[i]; }
+                stats = next;
+                accepted += 1;
+                changed = true;
+            }
+        }
+        if !changed { break; }
+    }
+    eprintln!("rhombus_post accepted={} rotations_saved={} total_delta={} score_delta={} tables={}",
+        accepted, initial_moves - stats.moves, stats.total - initial_total,
+        stats.score - initial_score, tables.len());
+    accepted
+}
+
 fn build_exits(N: usize, valid: &[bool]) -> (Vec<(usize, usize)>, Vec<i32>) {
     let W = 2 * N - 1;
     let inside = |r: isize, c: isize| r >= 0 && c >= 0 && r < W as isize && c < W as isize
@@ -1420,13 +1653,12 @@ fn main() {
     let mut best_orientation = initial.clone();
     let mut best_stats = initial_stats;
     eprintln!("initial k={} t={} m={} score={}", initial_stats.matched, initial_stats.total, initial_stats.moves, initial_stats.score);
-    let specials = special_order(&board);
     // All construction locks are discarded after this point.  The selected board
     // is only an initial state; the remaining time anneals every tile freely.
     let construction_deadline =
         (start + Duration::from_millis(CONSTRUCTION_LIMIT_MS)).min(deadline);
-
-    for &reserved in specials.iter().take(LAYERED_SPECIAL_TRIALS) {
+    let specials = special_order(&board);
+      for &reserved in specials.iter().take(LAYERED_SPECIAL_TRIALS) {
         if Instant::now() >= construction_deadline { break; }
         let outer_deadline = (Instant::now() + Duration::from_millis(700)).min(construction_deadline);
         let special_deadline = (outer_deadline + Duration::from_millis(350)).min(construction_deadline);
@@ -1442,9 +1674,9 @@ fn main() {
             best_stats = stats;
             best_orientation = candidate;
         }
-    }
+      }
 
-    for &width in &WIDTHS {
+      for &width in &WIDTHS {
         if Instant::now() >= construction_deadline { break; }
         let outer_deadline = (Instant::now() + Duration::from_millis(450)).min(construction_deadline);
         let (outer, _) = build_outer(&board, width, &[], outer_deadline);
@@ -1477,6 +1709,11 @@ fn main() {
     if Instant::now() < deadline {
         polish(&board, &mut best_orientation, (Instant::now() + Duration::from_millis(100)).min(deadline));
         search_rotations(&board, &mut best_orientation, Instant::now(), deadline);
+        let postprocess_deadline = Instant::now() + Duration::from_millis(POSTPROCESS_LIMIT_MS);
+        reduce_rotations_by_triangles(
+            &board, &mut best_orientation, postprocess_deadline);
+        reduce_rotations_by_rhombi(
+            &board, &mut best_orientation, postprocess_deadline);
         best_stats = board.evaluate(&best_orientation);
     }
     eprintln!("final k={} t={} m={} score={} elapsed_ms={}", best_stats.matched,

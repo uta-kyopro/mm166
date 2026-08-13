@@ -13,10 +13,10 @@
 - **seed 1〜100 は、ユーザーから明示的に指示された場合だけ実行する。** seed 1〜10 で改善していても、自動的に100 seedへ拡張しない。
 - `bests.txt` は削除・初期化せず、tester の `-bests` を常に指定して seed ごとの過去最高値を保持する。
 - 各評価結果は `scores/` 以下へ保存する。
-- 評価終了後は、最新コードの最終盤面を可視化し、`png/<seed:04>_<score>.png` として残す（例: seed 1、score 0 は `png/0001_0.png`）。
-- 同じseedのPNGは最新コードの結果1件だけを残し、スコアが変わった場合は古いファイルを置き換える。
+- 最終盤面の可視化は、ユーザーから明示的に指示された場合だけ実行する。通常評価後に自動では実行しない。
+- 可視化を指示された場合は、最新コードの最終盤面を `png/<seed:04>_<score>.png` として残す（例: seed 1、score 0 は `png/0001_0.png`）。同じseedのPNGは最新コードの結果1件だけを残す。
 - 比較実験では、コンパイル条件・tester条件・seed集合を揃える。
-- PNG確認は原則として評価したseed集合を一括処理する。1件だけ確認する場合は seed `1` とし、問題が確認された特定seedがある場合はそのseedを優先してよい。
+- 可視化を指示された場合、原則として評価したseed集合を一括処理する。1件だけ確認する場合は seed `1` とし、問題が確認された特定seedがある場合はそのseedを優先してよい。
 
 ## 初期準備
 
@@ -72,7 +72,7 @@ java -jar tester\tester.jar `
 python -c "import math; xs=[float(l.split('=',1)[1]) for l in open(r'scores\latest100.txt') if l.strip()]; print('mean_log10 =', '-inf' if any(x<=0 for x in xs) else sum(math.log10(x) for x in xs)/len(xs))"
 ```
 
-## 最終盤面PNGの保存
+## 明示指示がある場合のみ：最終盤面PNGの保存
 
 最新コードについて確認用seed集合をtesterの1回の起動で実行し、各seedの最終盤面だけを保存する。
 
@@ -143,7 +143,7 @@ Remove-Item $visDir -Recurse -Force
 4. `mean_log10` を現行版と比較する。
 5. seed 1〜100は、ユーザーから明示的な指示がある場合だけ実行する。改善していても自動的に拡張しない。
 6. `mean_log10` と seed ごとの差を確認して採否を決める。
-7. 最後に評価したseed集合を1回のtester起動で可視化し、各最終盤面PNGを `png/<seed:04>_<score>.png` に更新する。同じseedの古いPNGは残さない。
+7. ユーザーから明示的に画像化を指示された場合だけ、評価したseed集合を1回のtester起動で可視化し、各最終盤面PNGを `png/<seed:04>_<score>.png` に更新する。同じseedの古いPNGは残さない。
 8. `bests.txt` は常に維持し、過去最高値を失わない。
 9. 採用する最新の `src/HexTiles.rs` から提出用 `HexTiles.rs.zip` を再生成する。
 
