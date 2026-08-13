@@ -19,8 +19,8 @@ const CONSTRUCTION_LIMIT_MS: u64 = 4_500;
 const LOCAL_EXTEND_INTERVAL_MS: u64 = 60;
 const LOCAL_EXTEND_BUDGET_MS: u64 = 7;
 const LOCAL_PATTERN_LIMIT_4: usize = 480;
-const RESTORE_REPAIR_INTERVAL_MS: u64 = 80;
-const RESTORE_REPAIR_BUDGET_MS: u64 = 6;
+const RESTORE_REPAIR_INTERVAL_MS: u64 = 120;
+const RESTORE_REPAIR_BUDGET_MS: u64 = 5;
 const SA_START_TEMP: f64 = 240.0;
 const SA_END_TEMP: f64 = 1.0;
 const PATH_CONCENTRATION_WEIGHT: f64 = 0.01;
@@ -990,50 +990,139 @@ fn local_extend_candidate(
 fn restore_repair_candidate(
     board: &Board,
     orientation: &[u8],
+    base: Stats,
+    differential: &DifferentialEval,
+    scratch: &mut EvalScratch,
     rng: &mut Rng,
     deadline: Instant,
 ) -> Option<Vec<u8>> {
-    let rotated: Vec<usize> = (0..board.valid.len())
-        .filter(|&cell| board.valid[cell] && orientation[cell] != board.initial[cell])
+    let connected_mask = differential.contribution.iter().enumerate().fold(0u128, |mask, (id, &x)| {
+        if x > 0 { mask | (1u128 << id) } else { mask }
+    });
+    let cells: Vec<usize> = (0..board.valid.len())
+        .filter(|&cell| {
+            if !board.valid[cell] { return false; }
+            let paths = (differential.cell_masks[cell] & connected_mask).count_ones();
+            paths == 1 || paths == 2
+        })
         .collect();
-    if rotated.is_empty() { return None; }
-
-    // Restore one center tile, then exhaustively choose two adjacent tile
-    // orientations. This gives the three lines changed at the center a chance
-    // to reconnect locally instead of accepting a destructive one-tile move.
-    let attempts = rotated.len().min(8);
+    if cells.is_empty() { return None; }
+    let max_depth = (3 + board.W / 8).clamp(3, 10);
+    let beam_width = 8usize;
     let mut best: Option<(Stats, Vec<u8>)> = None;
-    for attempt in 0..attempts {
+    let mut updates = Vec::with_capacity(board.pairs.len());
+    let mut route = Vec::with_capacity(3 * board.valid_count);
+    let mut candidate_rank = vec![(usize::MAX, u32::MAX); board.valid.len()];
+
+    // A node may temporarily lose connections, but it is never exposed to SA.
+    // Grow a set of distinct tile changes until the original connection count is
+    // restored, then return the whole set as a single transaction.
+    for _ in 0..4 {
         if Instant::now() >= deadline { break; }
-        let center = rotated[(rng.usize(rotated.len()) + attempt) % rotated.len()];
-        let mut neighbors = Vec::new();
-        for side in 0..6 {
-            if let Some((cell, _)) = board.next(center, side) {
-                if !neighbors.contains(&cell) { neighbors.push(cell); }
+        let center = cells[rng.usize(cells.len())];
+        let mut beam: Vec<(Stats, Vec<u8>, Vec<usize>, u128, u128)> = Vec::new();
+        for oc in 0u8..6 {
+            if oc == orientation[center] { continue; }
+            let mut candidate = orientation.to_vec();
+            candidate[center] = oc;
+            let moves = base.moves
+                - rotation_cost(board.initial[center], orientation[center])
+                + rotation_cost(board.initial[center], oc);
+            let affected = differential.cell_masks[center];
+            let stats = differential.proposal(
+                board, &candidate, base, moves, affected, scratch, &mut updates);
+            if stats.matched < base.matched {
+                let lost = updates.iter().fold(0u128, |mask, &(id, value)| {
+                    if differential.contribution[id] > 0 && value == 0 {
+                        mask | (1u128 << id)
+                    } else { mask }
+                });
+                beam.push((stats, candidate, vec![center], affected, lost));
             }
         }
-        if neighbors.len() < 2 { continue; }
-        let offset = rng.usize(neighbors.len());
-        for step in 0..neighbors.len() {
-            let a = neighbors[(offset + step) % neighbors.len()];
-            let b = neighbors[(offset + step + 1) % neighbors.len()];
-            if a == b { continue; }
-            let mut candidate = orientation.to_vec();
-            candidate[center] = board.initial[center];
-            for oa in 0u8..6 {
-                candidate[a] = oa;
-                for ob in 0u8..6 {
-                    if Instant::now() >= deadline { break; }
-                    candidate[b] = ob;
-                    let stats = board.evaluate(&candidate);
-                    if best.as_ref().map_or(true, |x| {
-                        (stats.score, stats.matched, stats.total, Reverse(stats.moves))
-                            > (x.0.score, x.0.matched, x.0.total, Reverse(x.0.moves))
-                    }) {
-                        best = Some((stats, candidate.clone()));
+        beam.sort_unstable_by_key(|x| {
+            (Reverse(x.0.matched), Reverse(x.0.score), Reverse(x.0.total), x.0.moves)
+        });
+        beam.truncate(beam_width);
+
+        for _depth in 2..=max_depth {
+            if beam.is_empty() || Instant::now() >= deadline { break; }
+            let mut next_beam = Vec::new();
+            for (_, state, touched, affected, lost) in beam.into_iter() {
+                let mut ranked_pool: Vec<(usize, u32, usize)> = Vec::new();
+                let mut pool_cells = Vec::new();
+                for id in 0..board.pairs.len() {
+                    if lost >> id & 1 == 0 { continue; }
+                    route.clear();
+                    board.trace_pair(&state, id, scratch, Some(&mut route));
+                    let touched_positions: Vec<usize> = route.iter().enumerate()
+                        .filter_map(|(pos, cell)| touched.contains(cell).then_some(pos))
+                        .collect();
+                    for (pos, &cell) in route.iter().enumerate() {
+                        if touched.contains(&cell) { continue; }
+                        let distance = touched_positions.iter()
+                            .map(|&at| pos.abs_diff(at)).min().unwrap_or(usize::MAX / 2);
+                        let damage = (differential.cell_masks[cell] & connected_mask).count_ones();
+                        if candidate_rank[cell].0 == usize::MAX { pool_cells.push(cell); }
+                        if (distance, damage) < candidate_rank[cell] {
+                            candidate_rank[cell] = (distance, damage);
+                        }
+                    }
+                }
+                for cell in pool_cells {
+                    let (distance, damage) = candidate_rank[cell];
+                    ranked_pool.push((distance, damage, cell));
+                    candidate_rank[cell] = (usize::MAX, u32::MAX);
+                }
+                ranked_pool.sort_unstable();
+                let mut work = state.clone();
+                for (_, _, cell) in ranked_pool {
+                    for o in 0u8..6 {
+                        if o == state[cell] { continue; }
+                        if Instant::now() >= deadline { break; }
+                        work[cell] = o;
+                        let moves = base.moves + touched.iter().map(|&changed| {
+                            rotation_cost(board.initial[changed], state[changed])
+                                - rotation_cost(board.initial[changed], orientation[changed])
+                        }).sum::<i32>()
+                            + rotation_cost(board.initial[cell], o)
+                            - rotation_cost(board.initial[cell], orientation[cell]);
+                        let next_affected = affected | differential.cell_masks[cell];
+                        let stats = differential.proposal(
+                            board, &work, base, moves, next_affected, scratch, &mut updates);
+                        let mut changed = touched.clone();
+                        changed.push(cell);
+                        if stats.matched >= base.matched {
+                            if best.as_ref().map_or(true, |x| {
+                                (stats.score, stats.matched, stats.total, Reverse(stats.moves))
+                                    > (x.0.score, x.0.matched, x.0.total, Reverse(x.0.moves))
+                            }) {
+                                best = Some((stats, work.clone()));
+                            }
+                        } else {
+                            let next_lost = updates.iter().fold(0u128, |mask, &(id, value)| {
+                                if differential.contribution[id] > 0 && value == 0 {
+                                    mask | (1u128 << id)
+                                } else { mask }
+                            });
+                            next_beam.push((stats, work.clone(), changed, next_affected, next_lost));
+                            if next_beam.len() > 2 * beam_width {
+                                next_beam.sort_unstable_by_key(|x| {
+                                    (Reverse(x.0.matched), Reverse(x.0.score),
+                                     Reverse(x.0.total), x.0.moves)
+                                });
+                                next_beam.truncate(beam_width);
+                            }
+                        }
+                        work[cell] = state[cell];
                     }
                 }
             }
+            next_beam.sort_unstable_by_key(|x| {
+                (Reverse(x.0.matched), Reverse(x.0.score), Reverse(x.0.total), x.0.moves)
+            });
+            next_beam.truncate(beam_width);
+            beam = next_beam;
         }
     }
     best.map(|x| x.1)
@@ -1123,7 +1212,8 @@ fn search_rotations(board: &Board, orientation: &mut Vec<u8>, start: Instant, de
             let local_deadline =
                 (now + Duration::from_millis(RESTORE_REPAIR_BUDGET_MS)).min(deadline);
             if let Some(candidate) = restore_repair_candidate(
-                board, &current, &mut rng, local_deadline,
+                board, &current, current_stats, &differential, &mut eval_scratch,
+                &mut rng, local_deadline,
             ) {
                 let next = board.evaluate_with_scratch(&candidate, &mut eval_scratch);
                 if (next.score, next.matched, next.total, Reverse(next.moves))
