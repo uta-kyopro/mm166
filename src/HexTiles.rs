@@ -23,7 +23,6 @@ const RESTORE_REPAIR_INTERVAL_MS: u64 = 120;
 const RESTORE_REPAIR_BUDGET_MS: u64 = 5;
 const SA_START_TEMP: f64 = 240.0;
 const SA_END_TEMP: f64 = 1.0;
-const PATH_CONCENTRATION_WEIGHT: f64 = 0.01;
 const POSTPROCESS_LIMIT_MS: u64 = 450;
 
 struct Scanner {
@@ -92,7 +91,6 @@ struct EvalScratch {
 
 struct DifferentialEval {
     contribution: Vec<i64>,
-    square_sum: i64,
     cell_masks: Vec<u128>,
     pair_cells: Vec<Vec<usize>>,
 }
@@ -325,8 +323,7 @@ impl DifferentialEval {
                 orientation, id, scratch, Some(&mut pair_cells[id]));
             for &cell in &pair_cells[id] { cell_masks[cell] |= 1u128 << id; }
         }
-        let square_sum = contribution.iter().map(|&x| x * x).sum();
-        Self { contribution, square_sum, cell_masks, pair_cells }
+        Self { contribution, cell_masks, pair_cells }
     }
 
     fn proposal(
@@ -355,8 +352,6 @@ impl DifferentialEval {
     ) {
         for &(id, value) in updates {
             let bit = 1u128 << id;
-            self.square_sum += value * value
-                - self.contribution[id] * self.contribution[id];
             for &cell in &self.pair_cells[id] { self.cell_masks[cell] &= !bit; }
             route_cells.clear();
             board.trace_pair(orientation, id, scratch, Some(route_cells));
@@ -367,11 +362,6 @@ impl DifferentialEval {
         }
     }
 
-    fn proposed_square_sum(&self, updates: &[(usize, i64)]) -> i64 {
-        self.square_sum + updates.iter().map(|&(id, value)| {
-            value * value - self.contribution[id] * self.contribution[id]
-        }).sum::<i64>()
-    }
 }
 
 fn bit_test(bits: &[u64], cell: usize) -> bool {
@@ -1137,15 +1127,9 @@ fn search_rotations(board: &Board, orientation: &mut Vec<u8>, start: Instant, de
     let mut current_stats = board.evaluate_with_scratch(&current, &mut eval_scratch);
     let use_differential = board.W >= 15;
     let mut differential = DifferentialEval::new(board, &current, &mut eval_scratch);
-    let mut concentration = differential.square_sum as f64
-        / current_stats.total.max(1) as f64;
-    let energy = |s: Stats, concentrated: f64| {
+    let energy = |s: Stats| {
         let q = s.total - board.M as i64 * s.moves as i64;
-        let concentration_bonus = if use_differential {
-            PATH_CONCENTRATION_WEIGHT * s.matched as f64 * concentrated
-        } else { 0.0 };
         s.score as f64 + 3.0 * s.matched as f64 + 0.15 * q as f64
-            + concentration_bonus
     };
     let mut best = current.clone();
     let mut best_stats = current_stats;
@@ -1184,14 +1168,10 @@ fn search_rotations(board: &Board, orientation: &mut Vec<u8>, start: Instant, de
             ) {
                 let next = board.evaluate_with_scratch(&candidate, &mut eval_scratch);
                 let next_differential = DifferentialEval::new(board, &candidate, &mut eval_scratch);
-                let next_concentration = next_differential.square_sum as f64
-                    / next.total.max(1) as f64;
-                let diff = energy(next, next_concentration)
-                    - energy(current_stats, concentration);
+                let diff = energy(next) - energy(current_stats);
                 if diff >= 0.0 || rng.unit() < (diff / temperature).exp() {
                     current = candidate;
                     current_stats = next;
-                    concentration = next_concentration;
                     differential = next_differential;
                     extend_accepts += 1;
                     if (next.score, next.matched, next.total, Reverse(next.moves))
@@ -1224,8 +1204,6 @@ fn search_rotations(board: &Board, orientation: &mut Vec<u8>, start: Instant, de
                     current = candidate;
                     current_stats = next;
                     differential = DifferentialEval::new(board, &current, &mut eval_scratch);
-                    concentration = differential.square_sum as f64
-                        / current_stats.total.max(1) as f64;
                     repair_accepts += 1;
                     if (next.score, next.matched, next.total, Reverse(next.moves))
                         > (best_stats.score, best_stats.matched, best_stats.total, Reverse(best_stats.moves))
@@ -1266,13 +1244,9 @@ fn search_rotations(board: &Board, orientation: &mut Vec<u8>, start: Instant, de
         } else {
             board.evaluate_with_moves(&current, next_moves, &mut eval_scratch)
         };
-        let next_concentration = if use_differential {
-            differential.proposed_square_sum(&updates) as f64 / next.total.max(1) as f64
-        } else { 0.0 };
-        let diff = energy(next, next_concentration) - energy(current_stats, concentration);
+        let diff = energy(next) - energy(current_stats);
         if diff >= 0.0 || rng.unit() < (diff / temperature).exp() {
             current_stats = next;
-            concentration = next_concentration;
             if use_differential {
                 differential.commit(board, &current, &mut eval_scratch, &updates, &mut route_cells);
             }
@@ -1300,16 +1274,27 @@ fn search_rotations(board: &Board, orientation: &mut Vec<u8>, start: Instant, de
         (length, if length > 0 { value / length - 1 } else { -1 }, id)
     }).collect();
     actual.sort_unstable_by_key(|x| Reverse(x.0));
+    let bonus_count = board.bonus.iter().filter(|&&x| x).count() as i64;
+    let full_bonus_paths = actual.iter()
+        .filter(|&&(length, bonuses, _)| length > 0 && bonuses == bonus_count).count();
+    let total_bonus_uses: i64 = actual.iter()
+        .filter(|&&(length, _, _)| length > 0).map(|&(_, bonuses, _)| bonuses).sum();
+    let mut weighted: Vec<(i64, i64, i64, usize)> = actual.iter()
+        .filter(|&&(length, _, _)| length > 0)
+        .map(|&(length, bonuses, id)| (length * (bonuses + 1), length, bonuses, id))
+        .collect();
+    weighted.sort_unstable_by_key(|x| Reverse(x.0));
     let bonus_multiplier = (board.bonus.iter().filter(|&&x| x).count() + 1) as i64;
     let hero_rotation_budget = if board.M > 0 {
         actual[0].0.max(0) * bonus_multiplier / board.M as i64
     } else { i64::MAX };
-    eprintln!("rotation_search iterations={} extends={}/{} repairs={}/{} diff_avg={:.2} bonuses={} rotation_budget={}/{} actual_top3={:?} best_score={}",
+    eprintln!("rotation_search iterations={} extends={}/{} repairs={}/{} diff_avg={:.2} bonuses={} full_bonus_paths={} total_bonus_uses={} rotation_budget={}/{} longest3={:?} weighted3={:?} best_score={}",
         iterations, extend_accepts, extend_attempts, repair_accepts, repair_attempts,
         differential_pairs as f64 / iterations.max(1) as f64,
         board.bonus.iter().filter(|&&x| x).count(),
-        best_stats.moves, hero_rotation_budget,
+        full_bonus_paths, total_bonus_uses, best_stats.moves, hero_rotation_budget,
         &actual[..3],
+        &weighted[..weighted.len().min(3)],
         best_stats.score);
 }
 
@@ -1345,9 +1330,21 @@ fn region_signature(board: &Board, cells: &[usize], local: &[u8]) -> Vec<u8> {
     signature
 }
 
-fn reduce_rotations_by_triangles(
-    board: &Board, orientation: &mut Vec<u8>, deadline: Instant,
-) -> usize {
+fn region_geometry(board: &Board, cells: &[usize]) -> Vec<i8> {
+    let mut geometry = vec![-1; cells.len() * 6];
+    for i in 0..cells.len() {
+        for side in 0..6 {
+            if let Some((next, _)) = board.next(cells[i], side) {
+                if let Some(j) = cells.iter().position(|&cell| cell == next) {
+                    geometry[i * 6 + side] = j as i8;
+                }
+            }
+        }
+    }
+    geometry
+}
+
+fn collect_triangles(board: &Board) -> Vec<[usize; 3]> {
     let mut triangles = Vec::new();
     for a in 0..board.valid.len() {
         if !board.valid[a] { continue; }
@@ -1355,13 +1352,20 @@ fn reduce_rotations_by_triangles(
             let Some((b, _)) = board.next(a, side) else { continue; };
             let Some((c, _)) = board.next(a, (side + 1) % 6) else { continue; };
             if !(0..6).any(|d| board.next(b, d).is_some_and(|x| x.0 == c)) { continue; }
-            let mut tri = [a, b, c];
-            tri.sort_unstable();
-            triangles.push(tri);
+            let mut triangle = [a, b, c];
+            triangle.sort_unstable();
+            triangles.push(triangle);
         }
     }
     triangles.sort_unstable();
     triangles.dedup();
+    triangles
+}
+
+fn reduce_rotations_by_triangles(
+    board: &Board, orientation: &mut Vec<u8>, deadline: Instant,
+) -> usize {
+    let triangles = collect_triangles(board);
 
     let mut stats = board.evaluate(orientation);
     let initial_moves = stats.moves;
@@ -1424,18 +1428,23 @@ fn reduce_rotations_by_triangles(
     accepted
 }
 
-fn rhombus_geometry(board: &Board, cells: &[usize; 4]) -> Vec<i8> {
-    let mut geometry = vec![-1; 24];
-    for i in 0..4 {
+fn collect_rhombi(board: &Board) -> Vec<[usize; 4]> {
+    let mut rhombi = Vec::new();
+    for a in 0..board.valid.len() {
+        if !board.valid[a] { continue; }
         for side in 0..6 {
-            if let Some((next, _)) = board.next(cells[i], side) {
-                if let Some(j) = cells.iter().position(|&cell| cell == next) {
-                    geometry[i * 6 + side] = j as i8;
-                }
-            }
+            let Some((b, _)) = board.next(a, side) else { continue; };
+            let Some((c, _)) = board.next(a, (side + 1) % 6) else { continue; };
+            let Some((d, _)) = board.next(b, (side + 1) % 6) else { continue; };
+            if !board.next(c, side).is_some_and(|x| x.0 == d) { continue; }
+            let mut cells = [a, b, c, d];
+            cells.sort_unstable();
+            rhombi.push(cells);
         }
     }
-    geometry
+    rhombi.sort_unstable();
+    rhombi.dedup();
+    rhombi
 }
 
 fn rhombus_equivalence_table(board: &Board, cells: &[usize; 4]) -> Vec<Vec<u16>> {
@@ -1460,21 +1469,7 @@ fn rhombus_equivalence_table(board: &Board, cells: &[usize; 4]) -> Vec<Vec<u16>>
 fn reduce_rotations_by_rhombi(
     board: &Board, orientation: &mut Vec<u8>, deadline: Instant,
 ) -> usize {
-    let mut rhombi = Vec::new();
-    for a in 0..board.valid.len() {
-        if !board.valid[a] { continue; }
-        for side in 0..6 {
-            let Some((b, _)) = board.next(a, side) else { continue; };
-            let Some((c, _)) = board.next(a, (side + 1) % 6) else { continue; };
-            let Some((d, _)) = board.next(b, (side + 1) % 6) else { continue; };
-            if !board.next(c, side).is_some_and(|x| x.0 == d) { continue; }
-            let mut cells = [a, b, c, d];
-            cells.sort_unstable();
-            rhombi.push(cells);
-        }
-    }
-    rhombi.sort_unstable();
-    rhombi.dedup();
+    let rhombi = collect_rhombi(board);
 
     let mut tables: HashMap<Vec<i8>, Vec<Vec<u16>>> = HashMap::new();
     let mut stats = board.evaluate(orientation);
@@ -1491,7 +1486,7 @@ fn reduce_rotations_by_rhombi(
                     stats.score - initial_score, tables.len());
                 return accepted;
             }
-            let geometry = rhombus_geometry(board, cells);
+            let geometry = region_geometry(board, cells);
             if !tables.contains_key(&geometry) {
                 tables.insert(geometry.clone(), rhombus_equivalence_table(board, cells));
             }
@@ -1543,6 +1538,25 @@ fn reduce_rotations_by_rhombi(
         accepted, initial_moves - stats.moves, stats.total - initial_total,
         stats.score - initial_score, tables.len());
     accepted
+}
+
+fn improve_by_boundary_signatures(
+    board: &Board, orientation: &mut Vec<u8>, deadline: Instant,
+) {
+    let mut rounds = 0usize;
+    let mut triangle_accepted = 0usize;
+    let mut rhombus_accepted = 0usize;
+    while Instant::now() < deadline {
+        rounds += 1;
+        let triangles = reduce_rotations_by_triangles(board, orientation, deadline);
+        triangle_accepted += triangles;
+        if Instant::now() >= deadline { break; }
+        let rhombi = reduce_rotations_by_rhombi(board, orientation, deadline);
+        rhombus_accepted += rhombi;
+        if triangles == 0 && rhombi == 0 { break; }
+    }
+    eprintln!("signature_post rounds={} triangle_accepted={} rhombus_accepted={}",
+        rounds, triangle_accepted, rhombus_accepted);
 }
 
 fn build_exits(N: usize, valid: &[bool]) -> (Vec<(usize, usize)>, Vec<i32>) {
@@ -1710,9 +1724,7 @@ fn main() {
         polish(&board, &mut best_orientation, (Instant::now() + Duration::from_millis(100)).min(deadline));
         search_rotations(&board, &mut best_orientation, Instant::now(), deadline);
         let postprocess_deadline = Instant::now() + Duration::from_millis(POSTPROCESS_LIMIT_MS);
-        reduce_rotations_by_triangles(
-            &board, &mut best_orientation, postprocess_deadline);
-        reduce_rotations_by_rhombi(
+        improve_by_boundary_signatures(
             &board, &mut best_orientation, postprocess_deadline);
         best_stats = board.evaluate(&best_orientation);
     }
