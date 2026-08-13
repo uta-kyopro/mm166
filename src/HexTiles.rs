@@ -15,10 +15,14 @@ const WIDTHS: [usize; 3] = [1, 2, 3];
 const MAX_SPECIAL: usize = 3;
 const LAYERED_SPECIAL_TRIALS: usize = 2;
 const OUTER_LAYERS: usize = 3;
-const CONSTRUCTION_LIMIT_MS: u64 = 5_500;
+const CONSTRUCTION_LIMIT_MS: u64 = 4_500;
 const LOCAL_EXTEND_INTERVAL_MS: u64 = 60;
 const LOCAL_EXTEND_BUDGET_MS: u64 = 7;
 const LOCAL_PATTERN_LIMIT_4: usize = 480;
+const RESTORE_REPAIR_INTERVAL_MS: u64 = 80;
+const RESTORE_REPAIR_BUDGET_MS: u64 = 6;
+const SA_START_TEMP: f64 = 240.0;
+const SA_END_TEMP: f64 = 1.0;
 
 struct Scanner {
     input: io::Stdin,
@@ -79,6 +83,29 @@ struct DamageModel {
     base: Stats,
 }
 
+struct EvalScratch {
+    bonus_stamp: Vec<u32>,
+    epoch: u32,
+}
+
+struct DifferentialEval {
+    contribution: Vec<i64>,
+    cell_masks: Vec<u128>,
+    pair_cells: Vec<Vec<usize>>,
+}
+
+impl EvalScratch {
+    fn new(cells: usize) -> Self { Self { bonus_stamp: vec![0; cells], epoch: 0 } }
+    fn next_epoch(&mut self) -> u32 {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.bonus_stamp.fill(0);
+            self.epoch = 1;
+        }
+        self.epoch
+    }
+}
+
 struct Board {
     W: usize,
     M: i32,
@@ -88,6 +115,7 @@ struct Board {
     exits: Vec<(usize, usize)>,
     exit_id: Vec<i32>,
     pairs: Vec<[usize; 2]>,
+    transition: Vec<usize>,
     boundary_depth: Vec<usize>,
     valid_count: usize,
 }
@@ -157,14 +185,46 @@ impl Board {
     }
 
     fn evaluate(&self, orientation: &[u8]) -> Stats {
-        let mut s = Stats::default();
+        let mut scratch = EvalScratch::new(self.valid.len());
+        self.evaluate_with_scratch(orientation, &mut scratch)
+    }
+
+    fn evaluate_with_scratch(&self, orientation: &[u8], scratch: &mut EvalScratch) -> Stats {
+        let mut moves = 0;
         for cell in 0..orientation.len() {
             if self.valid[cell] {
-                s.moves += rotation_cost(self.initial[cell], orientation[cell]);
+                moves += rotation_cost(self.initial[cell], orientation[cell]);
             }
         }
+        self.evaluate_with_moves(orientation, moves, scratch)
+    }
+
+    fn evaluate_with_moves(
+        &self, orientation: &[u8], moves: i32, scratch: &mut EvalScratch,
+    ) -> Stats {
+        let mut s = Stats { moves, ..Stats::default() };
+        let terminal_base = self.valid.len() * 6;
         for pair in &self.pairs {
-            let (end, len, bonuses) = self.trace(orientation, pair[0]);
+            let epoch = scratch.next_epoch();
+            let (cell, enter) = self.exits[pair[0]];
+            let mut state = cell * 6 + enter;
+            let mut len = 0usize;
+            let mut bonuses = 0usize;
+            let mut end = usize::MAX;
+            for _ in 0..=3 * self.valid_count {
+                len += 1;
+                let cell = state / 6;
+                if self.bonus[cell] && scratch.bonus_stamp[cell] != epoch {
+                    scratch.bonus_stamp[cell] = epoch;
+                    bonuses += 1;
+                }
+                let next = self.transition[state * 6 + orientation[cell] as usize];
+                if next >= terminal_base {
+                    end = next - terminal_base;
+                    break;
+                }
+                state = next;
+            }
             if end == pair[1] {
                 s.matched += 1;
                 s.total += (len * (bonuses + 1)) as i64;
@@ -172,6 +232,36 @@ impl Board {
         }
         s.score = (s.matched as i64 * (s.total - self.M as i64 * s.moves as i64)).max(0);
         s
+    }
+
+    fn trace_pair(
+        &self, orientation: &[u8], id: usize, scratch: &mut EvalScratch,
+        mut cells: Option<&mut Vec<usize>>,
+    ) -> i64 {
+        let epoch = scratch.next_epoch();
+        let pair = self.pairs[id];
+        let (cell, enter) = self.exits[pair[0]];
+        let mut state = cell * 6 + enter;
+        let terminal_base = self.valid.len() * 6;
+        let mut len = 0usize;
+        let mut bonuses = 0usize;
+        for _ in 0..=3 * self.valid_count {
+            len += 1;
+            let cell = state / 6;
+            if let Some(path) = cells.as_deref_mut() { path.push(cell); }
+            if self.bonus[cell] && scratch.bonus_stamp[cell] != epoch {
+                scratch.bonus_stamp[cell] = epoch;
+                bonuses += 1;
+            }
+            let next = self.transition[state * 6 + orientation[cell] as usize];
+            if next >= terminal_base {
+                return if next - terminal_base == pair[1] {
+                    (len * (bonuses + 1)) as i64
+                } else { 0 };
+            }
+            state = next;
+        }
+        0
     }
 
     fn damage_model(&self, orientation: &[u8]) -> DamageModel {
@@ -218,6 +308,57 @@ impl Board {
             for state in local.keys() { globally_seen[*state] = true; }
         }
         true
+    }
+}
+
+impl DifferentialEval {
+    fn new(board: &Board, orientation: &[u8], scratch: &mut EvalScratch) -> Self {
+        assert!(board.pairs.len() <= 128);
+        let mut cell_masks = vec![0u128; board.valid.len()];
+        let mut pair_cells = vec![Vec::new(); board.pairs.len()];
+        let mut contribution = vec![0i64; board.pairs.len()];
+        for id in 0..board.pairs.len() {
+            contribution[id] = board.trace_pair(
+                orientation, id, scratch, Some(&mut pair_cells[id]));
+            for &cell in &pair_cells[id] { cell_masks[cell] |= 1u128 << id; }
+        }
+        Self { contribution, cell_masks, pair_cells }
+    }
+
+    fn proposal(
+        &self, board: &Board, orientation: &[u8], current: Stats, moves: i32,
+        affected: u128, scratch: &mut EvalScratch,
+        updates: &mut Vec<(usize, i64)>,
+    ) -> Stats {
+        let mut next = Stats { moves, matched: current.matched, total: current.total, score: 0 };
+        updates.clear();
+        for id in 0..board.pairs.len() {
+            if affected >> id & 1 == 0 { continue; }
+            let old = self.contribution[id];
+            let new = board.trace_pair(orientation, id, scratch, None);
+            if old > 0 { next.matched -= 1; next.total -= old; }
+            if new > 0 { next.matched += 1; next.total += new; }
+            updates.push((id, new));
+        }
+        next.score = (next.matched as i64
+            * (next.total - board.M as i64 * moves as i64)).max(0);
+        next
+    }
+
+    fn commit(
+        &mut self, board: &Board, orientation: &[u8], scratch: &mut EvalScratch,
+        updates: &[(usize, i64)], route_cells: &mut Vec<usize>,
+    ) {
+        for &(id, value) in updates {
+            let bit = 1u128 << id;
+            for &cell in &self.pair_cells[id] { self.cell_masks[cell] &= !bit; }
+            route_cells.clear();
+            board.trace_pair(orientation, id, scratch, Some(route_cells));
+            self.pair_cells[id].clear();
+            self.pair_cells[id].extend_from_slice(route_cells);
+            for &cell in &self.pair_cells[id] { self.cell_masks[cell] |= bit; }
+            self.contribution[id] = value;
+        }
     }
 }
 
@@ -739,7 +880,7 @@ fn local_extend_candidate(
     if paths.is_empty() { return None; }
     paths.sort_unstable_by_key(|x| Reverse(x.0));
     let pick = rng.usize(paths.len().min(4));
-    let (_, id, old_length, states) = &paths[pick];
+    let (old_value, id, old_length, states) = &paths[pick];
     let pair = board.pairs[*id];
     let mut on_path = vec![false; board.valid.len()];
     for &(cell, _) in states { on_path[cell] = true; }
@@ -789,7 +930,7 @@ fn local_extend_candidate(
         LOCAL_PATTERN_LIMIT_4.min(total_patterns)
     } else { total_patterns };
     let pattern_offset = rng.usize(total_patterns);
-    let mut candidates: Vec<(usize, i32, Vec<u8>)> = Vec::new();
+    let mut candidates: Vec<(i64, usize, i32, Vec<u8>)> = Vec::new();
     let mut trial = orientation.to_vec();
     for step in 0..checks {
         if Instant::now() >= deadline { break; }
@@ -804,18 +945,24 @@ fn local_extend_candidate(
         if !changed { continue; }
         let (end, length, bonuses) = board.trace(&trial, pair[0]);
         if end == pair[1] && length > *old_length {
+            let old_rotations: i32 = cells.iter()
+                .map(|&cell| rotation_cost(board.initial[cell], orientation[cell]))
+                .sum();
             let rotations: i32 = cells.iter()
                 .map(|&cell| rotation_cost(board.initial[cell], trial[cell]))
                 .sum();
-            candidates.push((length * (bonuses + 1), rotations,
+            let value = length * (bonuses + 1);
+            let net_gain = value as i64 - *old_value as i64
+                - board.M as i64 * (rotations - old_rotations) as i64;
+            candidates.push((net_gain, value, rotations,
                 cells.iter().map(|&cell| trial[cell]).collect()));
         }
         for &cell in &cells { trial[cell] = orientation[cell]; }
     }
-    candidates.sort_unstable_by_key(|x| (Reverse(x.0), x.1));
+    candidates.sort_unstable_by_key(|x| (Reverse(x.0), Reverse(x.1), x.2));
     candidates.truncate(8);
     let mut best: Option<(Stats, Vec<u8>)> = None;
-    for (_, _, values) in candidates {
+    for (_, _, _, values) in candidates {
         let mut candidate = orientation.to_vec();
         for (&cell, &o) in cells.iter().zip(values.iter()) { candidate[cell] = o; }
         let stats = board.evaluate(&candidate);
@@ -829,30 +976,102 @@ fn local_extend_candidate(
     best.map(|x| x.1)
 }
 
+fn restore_repair_candidate(
+    board: &Board,
+    orientation: &[u8],
+    rng: &mut Rng,
+    deadline: Instant,
+) -> Option<Vec<u8>> {
+    let rotated: Vec<usize> = (0..board.valid.len())
+        .filter(|&cell| board.valid[cell] && orientation[cell] != board.initial[cell])
+        .collect();
+    if rotated.is_empty() { return None; }
+
+    // Restore one center tile, then exhaustively choose two adjacent tile
+    // orientations. This gives the three lines changed at the center a chance
+    // to reconnect locally instead of accepting a destructive one-tile move.
+    let attempts = rotated.len().min(8);
+    let mut best: Option<(Stats, Vec<u8>)> = None;
+    for attempt in 0..attempts {
+        if Instant::now() >= deadline { break; }
+        let center = rotated[(rng.usize(rotated.len()) + attempt) % rotated.len()];
+        let mut neighbors = Vec::new();
+        for side in 0..6 {
+            if let Some((cell, _)) = board.next(center, side) {
+                if !neighbors.contains(&cell) { neighbors.push(cell); }
+            }
+        }
+        if neighbors.len() < 2 { continue; }
+        let offset = rng.usize(neighbors.len());
+        for step in 0..neighbors.len() {
+            let a = neighbors[(offset + step) % neighbors.len()];
+            let b = neighbors[(offset + step + 1) % neighbors.len()];
+            if a == b { continue; }
+            let mut candidate = orientation.to_vec();
+            candidate[center] = board.initial[center];
+            for oa in 0u8..6 {
+                candidate[a] = oa;
+                for ob in 0u8..6 {
+                    if Instant::now() >= deadline { break; }
+                    candidate[b] = ob;
+                    let stats = board.evaluate(&candidate);
+                    if best.as_ref().map_or(true, |x| {
+                        (stats.score, stats.matched, stats.total, Reverse(stats.moves))
+                            > (x.0.score, x.0.matched, x.0.total, Reverse(x.0.moves))
+                    }) {
+                        best = Some((stats, candidate.clone()));
+                    }
+                }
+            }
+        }
+    }
+    best.map(|x| x.1)
+}
+
 fn search_rotations(board: &Board, orientation: &mut Vec<u8>, start: Instant, deadline: Instant) {
     let cells: Vec<usize> = (0..board.valid.len()).filter(|&i| board.valid[i]).collect();
     let mut rng = Rng(0x9e3779b97f4a7c15 ^ board.W as u64 ^ ((board.M as u64) << 32));
+    let mut eval_scratch = EvalScratch::new(board.valid.len());
     let mut current = orientation.clone();
-    let mut current_stats = board.evaluate(&current);
+    let mut current_stats = board.evaluate_with_scratch(&current, &mut eval_scratch);
+    let use_differential = board.W >= 15;
+    let mut differential = DifferentialEval::new(board, &current, &mut eval_scratch);
     let mut best = current.clone();
     let mut best_stats = current_stats;
     let span = deadline.saturating_duration_since(start).as_secs_f64().max(0.001);
     let mut iterations = 0usize;
     let mut extend_attempts = 0usize;
     let mut extend_accepts = 0usize;
+    let mut repair_attempts = 0usize;
+    let mut repair_accepts = 0usize;
+    let mut differential_pairs = 0usize;
     let mut next_extend = start + Duration::from_millis(LOCAL_EXTEND_INTERVAL_MS);
-    while Instant::now() < deadline {
-        let frac = (start.elapsed().as_secs_f64() / span).min(1.0);
-        let temperature = 120.0 * (0.02f64).powf(frac);
-        if (board.W + 1) / 2 >= 17 && Instant::now() >= next_extend {
+    let mut next_repair = start + Duration::from_secs_f64(0.65 * span);
+    let mut now = Instant::now();
+    let mut temperature = SA_START_TEMP;
+    let mut undo = Vec::with_capacity(4);
+    let mut proposed = Vec::with_capacity(4);
+    let mut updates = Vec::with_capacity(board.pairs.len());
+    let mut route_cells = Vec::with_capacity(3 * board.valid_count);
+    loop {
+        // Time queries and powf are visible overhead on small boards, where an
+        // evaluation itself is very cheap.  A slightly stale temperature is
+        // harmless, so update the schedule once per batch instead of per move.
+        if iterations & 255 == 0 {
+            now = Instant::now();
+            if now >= deadline { break; }
+            let frac = (now.duration_since(start).as_secs_f64() / span).min(1.0);
+            temperature = SA_START_TEMP.powf(1.0 - frac) * SA_END_TEMP.powf(frac);
+        }
+        if (board.W + 1) / 2 >= 17 && now >= next_extend {
             next_extend += Duration::from_millis(LOCAL_EXTEND_INTERVAL_MS);
             extend_attempts += 1;
             let local_deadline =
-                (Instant::now() + Duration::from_millis(LOCAL_EXTEND_BUDGET_MS)).min(deadline);
+                (now + Duration::from_millis(LOCAL_EXTEND_BUDGET_MS)).min(deadline);
             if let Some(candidate) = local_extend_candidate(
                 board, &current, &mut rng, local_deadline,
             ) {
-                let next = board.evaluate(&candidate);
+                let next = board.evaluate_with_scratch(&candidate, &mut eval_scratch);
                 let energy = |s: Stats| {
                     let q = s.total - board.M as i64 * s.moves as i64;
                     s.score as f64 + 3.0 * s.matched as f64 + 0.15 * q as f64
@@ -861,6 +1080,7 @@ fn search_rotations(board: &Board, orientation: &mut Vec<u8>, start: Instant, de
                 if diff >= 0.0 || rng.unit() < (diff / temperature).exp() {
                     current = candidate;
                     current_stats = next;
+                    differential = DifferentialEval::new(board, &current, &mut eval_scratch);
                     extend_accepts += 1;
                     if (next.score, next.matched, next.total, Reverse(next.moves))
                         > (best_stats.score, best_stats.matched, best_stats.total, Reverse(best_stats.moves))
@@ -871,11 +1091,44 @@ fn search_rotations(board: &Board, orientation: &mut Vec<u8>, start: Instant, de
                     }
                 }
             }
+            now = Instant::now();
+            iterations += 1;
+            continue;
+        }
+        if now >= next_repair {
+            next_repair += Duration::from_millis(RESTORE_REPAIR_INTERVAL_MS);
+            repair_attempts += 1;
+            let local_deadline =
+                (now + Duration::from_millis(RESTORE_REPAIR_BUDGET_MS)).min(deadline);
+            if let Some(candidate) = restore_repair_candidate(
+                board, &current, &mut rng, local_deadline,
+            ) {
+                let next = board.evaluate_with_scratch(&candidate, &mut eval_scratch);
+                if (next.score, next.matched, next.total, Reverse(next.moves))
+                    > (current_stats.score, current_stats.matched,
+                        current_stats.total, Reverse(current_stats.moves))
+                {
+                    current = candidate;
+                    current_stats = next;
+                    differential = DifferentialEval::new(board, &current, &mut eval_scratch);
+                    repair_accepts += 1;
+                    if (next.score, next.matched, next.total, Reverse(next.moves))
+                        > (best_stats.score, best_stats.matched, best_stats.total, Reverse(best_stats.moves))
+                        && board.tester_safe(&current)
+                    {
+                        best_stats = next;
+                        best.clone_from(&current);
+                    }
+                }
+            }
+            now = Instant::now();
             iterations += 1;
             continue;
         }
         let changes = 1 + rng.usize(if cells.len() < 80 { 4 } else { 3 });
-        let mut undo = Vec::with_capacity(changes);
+        undo.clear();
+        proposed.clear();
+        let mut affected = 0u128;
         for _ in 0..changes {
             let cell = cells[rng.usize(cells.len())];
             if undo.iter().any(|&(x, _)| x == cell) { continue; }
@@ -883,9 +1136,21 @@ fn search_rotations(board: &Board, orientation: &mut Vec<u8>, start: Instant, de
             let mut new_o = rng.usize(6) as u8;
             if new_o == old { new_o = (new_o + 1) % 6; }
             undo.push((cell, old));
-            current[cell] = new_o;
+            proposed.push(new_o);
+            if use_differential { affected |= differential.cell_masks[cell]; }
         }
-        let next = board.evaluate(&current);
+        for (&(cell, _), &new_o) in undo.iter().zip(proposed.iter()) { current[cell] = new_o; }
+        let next_moves = current_stats.moves + undo.iter().map(|&(cell, old)| {
+            rotation_cost(board.initial[cell], current[cell])
+                - rotation_cost(board.initial[cell], old)
+        }).sum::<i32>();
+        let next = if use_differential {
+            differential_pairs += affected.count_ones() as usize;
+            differential.proposal(board, &current, current_stats, next_moves,
+                affected, &mut eval_scratch, &mut updates)
+        } else {
+            board.evaluate_with_moves(&current, next_moves, &mut eval_scratch)
+        };
         let energy = |s: Stats| {
             let q = s.total - board.M as i64 * s.moves as i64;
             s.score as f64 + 3.0 * s.matched as f64 + 0.15 * q as f64
@@ -893,6 +1158,9 @@ fn search_rotations(board: &Board, orientation: &mut Vec<u8>, start: Instant, de
         let diff = energy(next) - energy(current_stats);
         if diff >= 0.0 || rng.unit() < (diff / temperature).exp() {
             current_stats = next;
+            if use_differential {
+                differential.commit(board, &current, &mut eval_scratch, &updates, &mut route_cells);
+            }
             if (next.score, next.matched, next.total, Reverse(next.moves))
                 > (best_stats.score, best_stats.matched, best_stats.total, Reverse(best_stats.moves))
                 && board.tester_safe(&current)
@@ -901,13 +1169,19 @@ fn search_rotations(board: &Board, orientation: &mut Vec<u8>, start: Instant, de
                 best.clone_from(&current);
             }
         } else {
-            for (cell, old) in undo { current[cell] = old; }
+            for &(cell, old) in &undo { current[cell] = old; }
         }
         iterations += 1;
+        if use_differential && iterations & 65535 == 0 {
+            let exact = board.evaluate_with_scratch(&current, &mut eval_scratch);
+            assert_eq!((current_stats.matched, current_stats.total, current_stats.moves, current_stats.score),
+                (exact.matched, exact.total, exact.moves, exact.score));
+        }
     }
     orientation.clone_from(&best);
-    eprintln!("rotation_search iterations={} extends={}/{} best_score={}",
-        iterations, extend_accepts, extend_attempts, best_stats.score);
+    eprintln!("rotation_search iterations={} extends={}/{} repairs={}/{} diff_avg={:.2} best_score={}",
+        iterations, extend_accepts, extend_attempts, repair_accepts, repair_attempts,
+        differential_pairs as f64 / iterations.max(1) as f64, best_stats.score);
 }
 
 fn build_exits(N: usize, valid: &[bool]) -> (Vec<(usize, usize)>, Vec<i32>) {
@@ -988,8 +1262,31 @@ fn main() {
         }
     }
     let valid_count = valid.iter().filter(|&&x| x).count();
+    let terminal_base = valid.len() * 6;
+    let mut transition = vec![0usize; valid.len() * 36];
+    for cell in 0..valid.len() {
+        if !valid[cell] { continue; }
+        let r = cell / W;
+        let c = cell % W;
+        for enter in 0..6 {
+            let state = cell * 6 + enter;
+            for o in 0u8..6 {
+                let out = paired_dir(o, enter);
+                let nr = r as isize + DR[out];
+                let nc = c as isize + DC[out];
+                transition[state * 6 + o as usize] = if nr >= 0 && nc >= 0
+                    && nr < W as isize && nc < W as isize
+                    && valid[nr as usize * W + nc as usize]
+                {
+                    (nr as usize * W + nc as usize) * 6 + (out + 3) % 6
+                } else {
+                    terminal_base + exit_id[cell * 6 + out] as usize
+                };
+            }
+        }
+    }
     let board = Board { W, M, initial: initial.clone(), valid, bonus, exits, exit_id,
-        pairs, boundary_depth, valid_count };
+        pairs, transition, boundary_depth, valid_count };
 
     let initial_stats = board.evaluate(&initial);
     let mut best_orientation = initial.clone();

@@ -40,6 +40,7 @@ rustc -O src/HexTiles.rs -o HexTiles.exe
 java -jar tester\tester.jar `
   -exec ".\HexTiles.exe" `
   -seed 1,10 `
+  -threads 4 `
   -novis `
   -bests bests.txt `
   -saveScores scores\latest10.txt
@@ -59,6 +60,7 @@ python -c "import math; xs=[float(l.split('=',1)[1]) for l in open(r'scores\late
 java -jar tester\tester.jar `
   -exec ".\HexTiles.exe" `
   -seed 1,100 `
+  -threads 4 `
   -novis `
   -bests bests.txt `
   -saveScores scores\latest100.txt
