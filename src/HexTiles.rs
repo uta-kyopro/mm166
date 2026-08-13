@@ -23,6 +23,7 @@ const RESTORE_REPAIR_INTERVAL_MS: u64 = 80;
 const RESTORE_REPAIR_BUDGET_MS: u64 = 6;
 const SA_START_TEMP: f64 = 240.0;
 const SA_END_TEMP: f64 = 1.0;
+const PATH_CONCENTRATION_WEIGHT: f64 = 0.01;
 
 struct Scanner {
     input: io::Stdin,
@@ -90,6 +91,7 @@ struct EvalScratch {
 
 struct DifferentialEval {
     contribution: Vec<i64>,
+    square_sum: i64,
     cell_masks: Vec<u128>,
     pair_cells: Vec<Vec<usize>>,
 }
@@ -322,7 +324,8 @@ impl DifferentialEval {
                 orientation, id, scratch, Some(&mut pair_cells[id]));
             for &cell in &pair_cells[id] { cell_masks[cell] |= 1u128 << id; }
         }
-        Self { contribution, cell_masks, pair_cells }
+        let square_sum = contribution.iter().map(|&x| x * x).sum();
+        Self { contribution, square_sum, cell_masks, pair_cells }
     }
 
     fn proposal(
@@ -351,6 +354,8 @@ impl DifferentialEval {
     ) {
         for &(id, value) in updates {
             let bit = 1u128 << id;
+            self.square_sum += value * value
+                - self.contribution[id] * self.contribution[id];
             for &cell in &self.pair_cells[id] { self.cell_masks[cell] &= !bit; }
             route_cells.clear();
             board.trace_pair(orientation, id, scratch, Some(route_cells));
@@ -359,6 +364,12 @@ impl DifferentialEval {
             for &cell in &self.pair_cells[id] { self.cell_masks[cell] |= bit; }
             self.contribution[id] = value;
         }
+    }
+
+    fn proposed_square_sum(&self, updates: &[(usize, i64)]) -> i64 {
+        self.square_sum + updates.iter().map(|&(id, value)| {
+            value * value - self.contribution[id] * self.contribution[id]
+        }).sum::<i64>()
     }
 }
 
@@ -1036,9 +1047,15 @@ fn search_rotations(board: &Board, orientation: &mut Vec<u8>, start: Instant, de
     let mut current_stats = board.evaluate_with_scratch(&current, &mut eval_scratch);
     let use_differential = board.W >= 15;
     let mut differential = DifferentialEval::new(board, &current, &mut eval_scratch);
-    let energy = |s: Stats| {
+    let mut concentration = differential.square_sum as f64
+        / current_stats.total.max(1) as f64;
+    let energy = |s: Stats, concentrated: f64| {
         let q = s.total - board.M as i64 * s.moves as i64;
+        let concentration_bonus = if use_differential {
+            PATH_CONCENTRATION_WEIGHT * s.matched as f64 * concentrated
+        } else { 0.0 };
         s.score as f64 + 3.0 * s.matched as f64 + 0.15 * q as f64
+            + concentration_bonus
     };
     let mut best = current.clone();
     let mut best_stats = current_stats;
@@ -1077,10 +1094,14 @@ fn search_rotations(board: &Board, orientation: &mut Vec<u8>, start: Instant, de
             ) {
                 let next = board.evaluate_with_scratch(&candidate, &mut eval_scratch);
                 let next_differential = DifferentialEval::new(board, &candidate, &mut eval_scratch);
-                let diff = energy(next) - energy(current_stats);
+                let next_concentration = next_differential.square_sum as f64
+                    / next.total.max(1) as f64;
+                let diff = energy(next, next_concentration)
+                    - energy(current_stats, concentration);
                 if diff >= 0.0 || rng.unit() < (diff / temperature).exp() {
                     current = candidate;
                     current_stats = next;
+                    concentration = next_concentration;
                     differential = next_differential;
                     extend_accepts += 1;
                     if (next.score, next.matched, next.total, Reverse(next.moves))
@@ -1112,6 +1133,8 @@ fn search_rotations(board: &Board, orientation: &mut Vec<u8>, start: Instant, de
                     current = candidate;
                     current_stats = next;
                     differential = DifferentialEval::new(board, &current, &mut eval_scratch);
+                    concentration = differential.square_sum as f64
+                        / current_stats.total.max(1) as f64;
                     repair_accepts += 1;
                     if (next.score, next.matched, next.total, Reverse(next.moves))
                         > (best_stats.score, best_stats.matched, best_stats.total, Reverse(best_stats.moves))
@@ -1152,9 +1175,13 @@ fn search_rotations(board: &Board, orientation: &mut Vec<u8>, start: Instant, de
         } else {
             board.evaluate_with_moves(&current, next_moves, &mut eval_scratch)
         };
-        let diff = energy(next) - energy(current_stats);
+        let next_concentration = if use_differential {
+            differential.proposed_square_sum(&updates) as f64 / next.total.max(1) as f64
+        } else { 0.0 };
+        let diff = energy(next, next_concentration) - energy(current_stats, concentration);
         if diff >= 0.0 || rng.unit() < (diff / temperature).exp() {
             current_stats = next;
+            concentration = next_concentration;
             if use_differential {
                 differential.commit(board, &current, &mut eval_scratch, &updates, &mut route_cells);
             }
