@@ -21,6 +21,11 @@ const LOCAL_EXTEND_BUDGET_MS: u64 = 7;
 const LOCAL_PATTERN_LIMIT_4: usize = 480;
 const RESTORE_REPAIR_INTERVAL_MS: u64 = 120;
 const RESTORE_REPAIR_BUDGET_MS: u64 = 5;
+const CONNECT_REPAIR_INTERVAL_MS: u64 = 450;
+const CONNECT_REPAIR_BUDGET_MS: u64 = 25;
+const CONNECT_REPAIR_BEAM: usize = 48;
+const CONNECT_REPAIR_TARGETS: usize = 10;
+const ENABLE_CONNECT_REPAIR: bool = true; // paired evaluation switch
 const SA_START_TEMP: f64 = 240.0;
 const SA_END_TEMP: f64 = 1.0;
 const POSTPROCESS_LIMIT_MS: u64 = 450;
@@ -183,6 +188,18 @@ impl Board {
             }
         }
         (usize::MAX, length, bonuses)
+    }
+
+    fn trace_exit_cells(&self, orientation: &[u8], start: usize, cells: &mut Vec<usize>) {
+        cells.clear();
+        let (mut cell, mut enter) = self.exits[start];
+        for _ in 0..=3 * self.valid_count {
+            cells.push(cell);
+            let out = paired_dir(orientation[cell], enter);
+            let Some((next, next_enter)) = self.next(cell, out) else { break; };
+            cell = next;
+            enter = next_enter;
+        }
     }
 
     fn evaluate(&self, orientation: &[u8]) -> Stats {
@@ -1119,6 +1136,146 @@ fn restore_repair_candidate(
     best.map(|x| x.1)
 }
 
+struct ConnectRepairResult {
+    candidate: Option<Vec<u8>>,
+    trials: usize,
+    completed: usize,
+    target: usize,
+    area: usize,
+    changed: usize,
+    broken_peak: usize,
+}
+
+fn connect_repair_candidate(
+    board: &Board,
+    orientation: &[u8],
+    base: Stats,
+    differential: &DifferentialEval,
+    scratch: &mut EvalScratch,
+    deadline: Instant,
+) -> ConnectRepairResult {
+    let mut path_a = Vec::new();
+    let mut path_b = Vec::new();
+    let mut candidates: Vec<(usize, usize, Vec<usize>)> = Vec::new();
+    let cells_count = board.valid.len();
+    let mut goal_stamp = vec![false; cells_count];
+    let mut seen = vec![false; cells_count];
+    let mut parent = vec![usize::MAX; cells_count];
+    let mut queue = VecDeque::new();
+
+    for id in 0..board.pairs.len() {
+        if differential.contribution[id] > 0 { continue; }
+        board.trace_exit_cells(orientation, board.pairs[id][0], &mut path_a);
+        board.trace_exit_cells(orientation, board.pairs[id][1], &mut path_b);
+        for &cell in &path_b { goal_stamp[cell] = true; }
+        seen.fill(false);
+        parent.fill(usize::MAX);
+        queue.clear();
+        for &cell in &path_a {
+            if !seen[cell] { seen[cell] = true; queue.push_back(cell); }
+        }
+        let mut goal = usize::MAX;
+        while let Some(cell) = queue.pop_front() {
+            if goal_stamp[cell] { goal = cell; break; }
+            for side in 0..6 {
+                let Some((next, _)) = board.next(cell, side) else { continue; };
+                if !seen[next] {
+                    seen[next] = true;
+                    parent[next] = cell;
+                    queue.push_back(next);
+                }
+            }
+        }
+        for &cell in &path_b { goal_stamp[cell] = false; }
+        if goal == usize::MAX { continue; }
+        let mut corridor = Vec::new();
+        loop {
+            corridor.push(goal);
+            if parent[goal] == usize::MAX { break; }
+            goal = parent[goal];
+        }
+        if corridor.len() <= 5 { candidates.push((corridor.len(), id, corridor)); }
+    }
+    candidates.sort_unstable_by_key(|x| x.0);
+
+    let mut best: Option<(Stats, Vec<u8>, usize, usize, usize, usize)> = None;
+    let mut trials = 0usize;
+    let mut completed = 0usize;
+    let mut updates = Vec::with_capacity(board.pairs.len());
+    for (_, target, corridor) in candidates.into_iter().take(CONNECT_REPAIR_TARGETS) {
+        if Instant::now() >= deadline { break; }
+        let mut in_region = vec![false; cells_count];
+        let mut region = Vec::new();
+        for &cell in &corridor {
+            if !in_region[cell] { in_region[cell] = true; region.push(cell); }
+            for side in 0..6 {
+                if let Some((next, _)) = board.next(cell, side) {
+                    if !in_region[next] { in_region[next] = true; region.push(next); }
+                }
+            }
+        }
+        if region.len() > 9 { continue; }
+        trials += 1;
+        region.sort_unstable();
+        let mut affected = 1u128 << target;
+        for &cell in &region { affected |= differential.cell_masks[cell]; }
+
+        // Monotone region indices avoid generating the same changed subset in
+        // different orders. Intermediate states may lose matches; only a complete
+        // transaction that adds a match and improves the exact score is returned.
+        let mut beam: Vec<(Stats, i64, i32, usize, usize, Vec<u8>)> = vec![
+            (base, 0, base.moves, 0, 0, orientation.to_vec())
+        ];
+        for _depth in 1..=region.len() {
+            if Instant::now() >= deadline { break; }
+            let mut next_beam = Vec::new();
+            for (_, _, moves, next_at, broken_peak, state) in beam.into_iter() {
+                for ri in next_at..region.len() {
+                    let cell = region[ri];
+                    for o in 0u8..6 {
+                        if o == orientation[cell] { continue; }
+                        let mut work = state.clone();
+                        work[cell] = o;
+                        let next_moves = moves
+                            - rotation_cost(board.initial[cell], state[cell])
+                            + rotation_cost(board.initial[cell], o);
+                        let stats = differential.proposal(
+                            board, &work, base, next_moves, affected, scratch, &mut updates);
+                        let target_value = updates.iter().find_map(|&(id, value)|
+                            (id == target).then_some(value)).unwrap_or(0);
+                        if target_value > 0 { completed += 1; }
+                        let next_broken_peak = broken_peak.max(base.matched.saturating_sub(stats.matched));
+                        if stats.matched >= base.matched + 1 && stats.score > base.score {
+                            if best.as_ref().map_or(true, |x| stats.score > x.0.score) {
+                                let changed = region.iter().filter(|&&x|
+                                    work[x] != orientation[x]).count();
+                                best = Some((stats, work.clone(), target, region.len(),
+                                             changed, next_broken_peak));
+                            }
+                        }
+                        next_beam.push((stats, target_value, next_moves, ri + 1,
+                                        next_broken_peak, work));
+                    }
+                }
+            }
+            next_beam.sort_unstable_by_key(|x| {
+                (Reverse(x.1 > 0), Reverse(x.0.matched), Reverse(x.0.score),
+                 Reverse(x.0.total), x.0.moves)
+            });
+            next_beam.truncate(CONNECT_REPAIR_BEAM);
+            beam = next_beam;
+            if beam.is_empty() { break; }
+        }
+    }
+    if let Some((_, candidate, target, area, changed, broken_peak)) = best {
+        ConnectRepairResult { candidate: Some(candidate), trials, completed,
+            target, area, changed, broken_peak }
+    } else {
+        ConnectRepairResult { candidate: None, trials, completed, target: usize::MAX,
+            area: 0, changed: 0, broken_peak: 0 }
+    }
+}
+
 fn search_rotations(board: &Board, orientation: &mut Vec<u8>, start: Instant, deadline: Instant) {
     let cells: Vec<usize> = (0..board.valid.len()).filter(|&i| board.valid[i]).collect();
     let mut rng = Rng(0x9e3779b97f4a7c15 ^ board.W as u64 ^ ((board.M as u64) << 32));
@@ -1139,9 +1296,15 @@ fn search_rotations(board: &Board, orientation: &mut Vec<u8>, start: Instant, de
     let mut extend_accepts = 0usize;
     let mut repair_attempts = 0usize;
     let mut repair_accepts = 0usize;
+    let mut connect_attempts = 0usize;
+    let mut connect_accepts = 0usize;
+    let mut connect_trials = 0usize;
+    let mut connect_completed = 0usize;
+    let mut connect_events = Vec::new();
     let mut differential_pairs = 0usize;
     let mut next_extend = start + Duration::from_millis(LOCAL_EXTEND_INTERVAL_MS);
     let mut next_repair = start + Duration::from_secs_f64(0.65 * span);
+    let mut next_connect = start + Duration::from_secs_f64(0.55 * span);
     let mut now = Instant::now();
     let mut temperature = SA_START_TEMP;
     let mut undo = Vec::with_capacity(4);
@@ -1205,6 +1368,46 @@ fn search_rotations(board: &Board, orientation: &mut Vec<u8>, start: Instant, de
                     current_stats = next;
                     differential = DifferentialEval::new(board, &current, &mut eval_scratch);
                     repair_accepts += 1;
+                    if (next.score, next.matched, next.total, Reverse(next.moves))
+                        > (best_stats.score, best_stats.matched, best_stats.total, Reverse(best_stats.moves))
+                        && board.tester_safe(&current)
+                    {
+                        best_stats = next;
+                        best.clone_from(&current);
+                    }
+                }
+            }
+            now = Instant::now();
+            iterations += 1;
+            continue;
+        }
+        if ENABLE_CONNECT_REPAIR && now >= next_connect {
+            next_connect += Duration::from_millis(CONNECT_REPAIR_INTERVAL_MS);
+            connect_attempts += 1;
+            let local_deadline =
+                (now + Duration::from_millis(CONNECT_REPAIR_BUDGET_MS)).min(deadline);
+            let outcome = connect_repair_candidate(
+                board, &current, current_stats, &differential, &mut eval_scratch,
+                local_deadline,
+            );
+            connect_trials += outcome.trials;
+            connect_completed += outcome.completed;
+            let event_meta = (outcome.target, outcome.area, outcome.changed,
+                              outcome.broken_peak);
+            if let Some(candidate) = outcome.candidate {
+                let previous = current_stats;
+                let next = board.evaluate_with_scratch(&candidate, &mut eval_scratch);
+                if next.matched > current_stats.matched && next.score > current_stats.score {
+                    current = candidate;
+                    current_stats = next;
+                    differential = DifferentialEval::new(board, &current, &mut eval_scratch);
+                    connect_accepts += 1;
+                    connect_events.push((event_meta.0,
+                        next.matched as i64 - previous.matched as i64,
+                        next.total - previous.total,
+                        next.moves - previous.moves,
+                        next.score - previous.score,
+                        event_meta.1, event_meta.2, event_meta.3));
                     if (next.score, next.matched, next.total, Reverse(next.moves))
                         > (best_stats.score, best_stats.matched, best_stats.total, Reverse(best_stats.moves))
                         && board.tester_safe(&current)
@@ -1288,14 +1491,108 @@ fn search_rotations(board: &Board, orientation: &mut Vec<u8>, start: Instant, de
     let hero_rotation_budget = if board.M > 0 {
         actual[0].0.max(0) * bonus_multiplier / board.M as i64
     } else { i64::MAX };
-    eprintln!("rotation_search iterations={} extends={}/{} repairs={}/{} diff_avg={:.2} bonuses={} full_bonus_paths={} total_bonus_uses={} rotation_budget={}/{} longest3={:?} weighted3={:?} best_score={}",
+    eprintln!("rotation_search iterations={} extends={}/{} repairs={}/{} connects={}/{} diff_avg={:.2} bonuses={} full_bonus_paths={} total_bonus_uses={} rotation_budget={}/{} longest3={:?} weighted3={:?} best_score={}",
         iterations, extend_accepts, extend_attempts, repair_accepts, repair_attempts,
+        connect_accepts, connect_attempts,
         differential_pairs as f64 / iterations.max(1) as f64,
         board.bonus.iter().filter(|&&x| x).count(),
         full_bonus_paths, total_bonus_uses, best_stats.moves, hero_rotation_budget,
         &actual[..3],
         &weighted[..weighted.len().min(3)],
         best_stats.score);
+    eprintln!("connect_repair trials={} completed={} accepted={} events={:?}",
+        connect_trials, connect_completed, connect_accepts, connect_events);
+}
+
+fn log_solution_diagnostics(board: &Board, orientation: &[u8], stats: Stats) {
+    let mut scratch = EvalScratch::new(board.valid.len());
+    let bonus_count = board.bonus.iter().filter(|&&x| x).count();
+    let mut bonus_index = vec![usize::MAX; board.valid.len()];
+    let mut next_bonus = 0usize;
+    for cell in 0..board.bonus.len() {
+        if board.bonus[cell] {
+            bonus_index[cell] = next_bonus;
+            next_bonus += 1;
+        }
+    }
+    let full_bonus_mask = (1u16 << bonus_count) - 1;
+    let mut gap_count = vec![0usize; bonus_count + 1];
+    let mut gap_length = vec![0i64; bonus_count + 1];
+    let mut gap_potential = vec![0i64; bonus_count + 1];
+    let mut near_full = Vec::new();
+    let mut bonus_users = vec![Vec::new(); bonus_count];
+    let mut bonus_visits = vec![0usize; bonus_count];
+    let mut missing_d12_length = vec![0i64; bonus_count];
+    let mut route_cells = Vec::new();
+    let mut full_bonus_paths = 0usize;
+    let mut full_bonus_length = 0i64;
+    let mut matched_length = 0i64;
+    let mut total_bonus_uses = 0i64;
+    let mut weighted = Vec::new();
+    for id in 0..board.pairs.len() {
+        route_cells.clear();
+        let (value, length) = board.trace_pair(
+            orientation, id, &mut scratch, Some(&mut route_cells));
+        if length == 0 { continue; }
+        let mut bonus_mask = 0u16;
+        for &cell in &route_cells {
+            let index = bonus_index[cell];
+            if index != usize::MAX {
+                bonus_mask |= 1u16 << index;
+                bonus_visits[index] += 1;
+            }
+        }
+        let bonuses = bonus_mask.count_ones() as i64;
+        debug_assert_eq!(bonuses, value / length - 1);
+        let missing_mask = full_bonus_mask ^ bonus_mask;
+        let gap = missing_mask.count_ones() as usize;
+        gap_count[gap] += 1;
+        gap_length[gap] += length;
+        gap_potential[gap] += length * gap as i64;
+        if gap <= 2 {
+            near_full.push((gap, length, id, missing_mask, value));
+            for index in 0..bonus_count {
+                if missing_mask >> index & 1 != 0 {
+                    missing_d12_length[index] += length;
+                }
+            }
+        }
+        for index in 0..bonus_count {
+            if bonus_mask >> index & 1 != 0 { bonus_users[index].push(id); }
+        }
+        matched_length += length;
+        total_bonus_uses += bonuses;
+        if bonuses == bonus_count as i64 {
+            full_bonus_paths += 1;
+            full_bonus_length += length;
+        }
+        weighted.push((value, length, bonuses, id));
+    }
+    weighted.sort_unstable_by_key(|x| Reverse(x.0));
+    near_full.sort_unstable_by_key(|x| (x.0, Reverse(x.1)));
+    let gap_groups: Vec<_> = (0..=bonus_count)
+        .filter(|&d| gap_count[d] != 0)
+        .map(|d| (d, gap_count[d], gap_length[d], gap_potential[d]))
+        .collect();
+    let segment_capacity = (3 * board.valid_count) as f64;
+    let bonus_capacity = (3 * bonus_count) as f64;
+    let rotation_penalty = board.M as i64 * stats.moves as i64;
+    let q = stats.total - rotation_penalty;
+    let k_ratio = stats.matched as f64 / board.pairs.len().max(1) as f64;
+    let full_length_ratio = full_bonus_length as f64 / segment_capacity.max(1.0);
+    let matched_length_ratio = matched_length as f64 / segment_capacity.max(1.0);
+    let bonus_util = if bonus_count == 0 { 1.0 }
+        else { total_bonus_uses as f64 / bonus_capacity };
+    let rotation_ratio = rotation_penalty as f64 / stats.total.max(1) as f64;
+    let delta_h_10 = 0.1 * q.max(0) as f64 / (bonus_count + 1) as f64;
+    eprintln!("diagnostic P={} V={} B={} k={} t={} m={} q={} k_ratio={:.6} full_paths={} full_len={} full_len_ratio={:.6} matched_len={} matched_len_ratio={:.6} bonus_uses={} bonus_util={:.6} rotation_ratio={:.6} delta_h_10={:.3} weighted3={:?}",
+        board.pairs.len(), board.valid_count, bonus_count, stats.matched, stats.total,
+        stats.moves, q, k_ratio, full_bonus_paths, full_bonus_length, full_length_ratio,
+        matched_length, matched_length_ratio, total_bonus_uses, bonus_util,
+        rotation_ratio, delta_h_10, &weighted[..weighted.len().min(3)]);
+    eprintln!("bonus_gap groups={:?} near_full_top={:?} missing_d12_length={:?} bonus_visits={:?} bonus_users={:?}",
+        gap_groups, &near_full[..near_full.len().min(12)], missing_d12_length,
+        bonus_visits, bonus_users);
 }
 
 fn region_signature(board: &Board, cells: &[usize], local: &[u8]) -> Vec<u8> {
@@ -1728,6 +2025,7 @@ fn main() {
             &board, &mut best_orientation, postprocess_deadline);
         best_stats = board.evaluate(&best_orientation);
     }
+    log_solution_diagnostics(&board, &best_orientation, best_stats);
     eprintln!("final k={} t={} m={} score={} elapsed_ms={}", best_stats.matched,
         best_stats.total, best_stats.moves, best_stats.score, start.elapsed().as_millis());
 
