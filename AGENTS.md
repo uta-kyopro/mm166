@@ -166,6 +166,8 @@ tar -tf HexTiles.rs.zip
 
 ## Git管理・push方針
 
+既存のGitHub remoteへの通常のcommit・pushは、GitHub CLI (`gh`) がなくても `git` コマンドで実行する。ユーザーが「プッシュして」と指示した場合、PR作成の指定がなければ現在のブランチへ直接commit・pushしてよい。`gh` の未導入だけを理由に停止しない。
+
 Gitへcommit・pushする対象は以下に限定する。
 
 - 提出可能な `HexTiles.rs.zip`
