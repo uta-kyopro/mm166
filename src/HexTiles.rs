@@ -29,6 +29,7 @@ const ENABLE_CONNECT_REPAIR: bool = true; // paired evaluation switch
 const SA_START_TEMP: f64 = 240.0;
 const SA_END_TEMP: f64 = 1.0;
 const POSTPROCESS_LIMIT_MS: u64 = 450;
+const ENABLE_TRANSITION_TABLE: bool = true; // paired evaluation switch
 
 struct Scanner {
     input: io::Stdin,
@@ -1641,6 +1642,189 @@ fn region_geometry(board: &Board, cells: &[usize]) -> Vec<i8> {
     geometry
 }
 
+fn collect_connected_regions(board: &Board, max_size: usize) -> Vec<Vec<usize>> {
+    let mut all = Vec::new();
+    let mut level: Vec<Vec<usize>> = (0..board.valid.len())
+        .filter(|&cell| board.valid[cell]).map(|cell| vec![cell]).collect();
+    for size in 1..=max_size {
+        if size >= 2 { all.extend(level.iter().cloned()); }
+        if size == max_size { break; }
+        let mut next_level = Vec::new();
+        for cells in &level {
+            for &cell in cells {
+                for side in 0..6 {
+                    let Some((next, _)) = board.next(cell, side) else { continue; };
+                    if cells.contains(&next) { continue; }
+                    let mut grown = cells.clone();
+                    grown.push(next);
+                    grown.sort_unstable();
+                    next_level.push(grown);
+                }
+            }
+        }
+        next_level.sort_unstable();
+        next_level.dedup();
+        level = next_level;
+    }
+    all
+}
+
+fn transition_equivalence_table(board: &Board, cells: &[usize]) -> Vec<Vec<u16>> {
+    let count = 6usize.pow(cells.len() as u32);
+    let mut groups: HashMap<Vec<u8>, Vec<u16>> = HashMap::new();
+    for code in 0..count {
+        let mut x = code;
+        let mut local = vec![0u8; cells.len()];
+        for o in &mut local { *o = (x % 6) as u8; x /= 6; }
+        groups.entry(region_signature(board, cells, &local))
+            .or_default().push(code as u16);
+    }
+    let mut table = vec![Vec::new(); count];
+    for group in groups.into_values() {
+        for &code in &group { table[code as usize] = group.clone(); }
+    }
+    table
+}
+
+fn transition_descriptor(
+    board: &Board, cells: &[usize], local: &[u8],
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let mut boundary = Vec::new();
+    for i in 0..cells.len() {
+        for side in 0..6 {
+            if !board.next(cells[i], side).is_some_and(|(next, _)| cells.contains(&next)) {
+                boundary.push((i, side));
+            }
+        }
+    }
+    let mut pairing = Vec::with_capacity(boundary.len());
+    let mut lengths = Vec::with_capacity(boundary.len());
+    let mut bonuses = Vec::with_capacity(boundary.len());
+    for &(start_cell, start_side) in &boundary {
+        let mut cell = start_cell;
+        let mut enter = start_side;
+        let mut length = 0u8;
+        let mut bonus_mask = 0u8;
+        loop {
+            length += 1;
+            if board.bonus[cells[cell]] { bonus_mask |= 1 << cell; }
+            let out = paired_dir(local[cell], enter);
+            if let Some((next, next_enter)) = board.next(cells[cell], out) {
+                if let Some(next_local) = cells.iter().position(|&x| x == next) {
+                    cell = next_local;
+                    enter = next_enter;
+                    continue;
+                }
+            }
+            pairing.push(boundary.iter().position(|&(i, side)| i == cell && side == out)
+                .unwrap() as u8);
+            lengths.push(length);
+            bonuses.push(bonus_mask);
+            break;
+        }
+    }
+    (pairing, lengths, bonuses)
+}
+
+fn improve_by_transition_tables(
+    board: &Board, orientation: &mut Vec<u8>, deadline: Instant,
+) -> usize {
+    let started = Instant::now();
+    let regions = collect_connected_regions(board, 4);
+    let mut tables: HashMap<Vec<i8>, Vec<Vec<u16>>> = HashMap::new();
+    let mut scratch = EvalScratch::new(board.valid.len());
+    let mut differential = DifferentialEval::new(board, orientation, &mut scratch);
+    let mut stats = board.evaluate_with_scratch(orientation, &mut scratch);
+    let initial = stats;
+    let mut accepted = 0usize;
+    let mut tested = 0usize;
+    let mut visited = 0usize;
+    let mut tested_by_size = [0usize; 5];
+    let mut accepted_by_size = [0usize; 5];
+    let mut updates = Vec::new();
+    let mut route_cells = Vec::new();
+    for cells in &regions {
+        if Instant::now() >= deadline { break; }
+        visited += 1;
+        // Exhaustive enumeration shows that an adjacent two-cell region has no
+        // non-trivial orientation with the same boundary transition.
+        if cells.len() == 2 { continue; }
+        let geometry = region_geometry(board, cells);
+        if !tables.contains_key(&geometry) {
+            tables.insert(geometry.clone(), transition_equivalence_table(board, cells));
+        }
+        let mut current = Vec::with_capacity(cells.len());
+        let mut current_code = 0usize;
+        let mut place = 1usize;
+        for &cell in cells {
+            current.push(orientation[cell]);
+            current_code += place * orientation[cell] as usize;
+            place *= 6;
+        }
+        let group = &tables[&geometry][current_code];
+        if group.len() <= 1 { continue; }
+        let mut options = Vec::new();
+        for &raw in group {
+            let mut code = raw as usize;
+            let mut local = vec![0u8; cells.len()];
+            for o in &mut local { *o = (code % 6) as u8; code /= 6; }
+            let moves: i32 = cells.iter().enumerate().map(|(i, &cell)|
+                rotation_cost(board.initial[cell], local[i])).sum();
+            let (_, lengths, bonuses) = transition_descriptor(board, cells, &local);
+            options.push((raw, moves, lengths, bonuses, local));
+        }
+        let mut pareto = Vec::new();
+        for i in 0..options.len() {
+            let dominated = (0..options.len()).any(|j| i != j
+                && options[j].1 <= options[i].1
+                && options[j].2.iter().zip(&options[i].2).all(|(a, b)| a >= b)
+                && options[j].3.iter().zip(&options[i].3).all(|(a, b)| a | b == *a)
+                && (options[j].1 < options[i].1
+                    || options[j].2 != options[i].2 || options[j].3 != options[i].3));
+            if !dominated { pareto.push(i); }
+        }
+        let mut affected = 0u128;
+        let mut old_local_moves = 0i32;
+        for &cell in cells {
+            affected |= differential.cell_masks[cell];
+            old_local_moves += rotation_cost(board.initial[cell], orientation[cell]);
+        }
+        let mut best: Option<(Stats, Vec<u8>, Vec<(usize, i64)>)> = None;
+        for i in pareto {
+            if options[i].0 as usize == current_code { continue; }
+            tested += 1;
+            tested_by_size[cells.len()] += 1;
+            for (at, &cell) in cells.iter().enumerate() { orientation[cell] = options[i].4[at]; }
+            let moves = stats.moves - old_local_moves + options[i].1;
+            let candidate = differential.proposal(
+                board, orientation, stats, moves, affected, &mut scratch, &mut updates);
+            if candidate.matched == stats.matched && candidate.score > stats.score
+                && best.as_ref().map_or(true, |x| candidate.score > x.0.score)
+            {
+                best = Some((candidate, options[i].4.clone(), updates.clone()));
+            }
+            for (at, &cell) in cells.iter().enumerate() { orientation[cell] = current[at]; }
+            if Instant::now() >= deadline { break; }
+        }
+        if let Some((next, local, best_updates)) = best {
+            for (at, &cell) in cells.iter().enumerate() { orientation[cell] = local[at]; }
+            differential.commit(
+                board, orientation, &mut scratch, &best_updates, &mut route_cells);
+            stats = next;
+            accepted += 1;
+            accepted_by_size[cells.len()] += 1;
+        }
+    }
+    let verified = board.evaluate_with_scratch(orientation, &mut scratch);
+    assert!(verified.matched == stats.matched && verified.total == stats.total
+        && verified.moves == stats.moves && verified.score == stats.score);
+    eprintln!("transition_table regions={} visited={} geometries={} tested={} tested_by_size={:?} accepted={} accepted_by_size={:?} moves_delta={} total_delta={} score_delta={} elapsed_ms={}",
+        regions.len(), visited, tables.len(), tested, &tested_by_size[2..], accepted,
+        &accepted_by_size[2..], stats.moves - initial.moves,
+        stats.total - initial.total, stats.score - initial.score, started.elapsed().as_millis());
+    accepted
+}
+
 fn collect_triangles(board: &Board) -> Vec<[usize; 3]> {
     let mut triangles = Vec::new();
     for a in 0..board.valid.len() {
@@ -1840,6 +2024,10 @@ fn reduce_rotations_by_rhombi(
 fn improve_by_boundary_signatures(
     board: &Board, orientation: &mut Vec<u8>, deadline: Instant,
 ) {
+    let table_accepted = if ENABLE_TRANSITION_TABLE {
+        let table_deadline = (Instant::now() + Duration::from_millis(100)).min(deadline);
+        improve_by_transition_tables(board, orientation, table_deadline)
+    } else { 0 };
     let mut rounds = 0usize;
     let mut triangle_accepted = 0usize;
     let mut rhombus_accepted = 0usize;
@@ -1852,8 +2040,8 @@ fn improve_by_boundary_signatures(
         rhombus_accepted += rhombi;
         if triangles == 0 && rhombi == 0 { break; }
     }
-    eprintln!("signature_post rounds={} triangle_accepted={} rhombus_accepted={}",
-        rounds, triangle_accepted, rhombus_accepted);
+    eprintln!("signature_post rounds={} table_accepted={} triangle_accepted={} rhombus_accepted={}",
+        rounds, table_accepted, triangle_accepted, rhombus_accepted);
 }
 
 fn build_exits(N: usize, valid: &[bool]) -> (Vec<(usize, usize)>, Vec<i32>) {
