@@ -32,6 +32,15 @@ const SA_END_TEMP: f64 = 0.01;
 const POSTPROCESS_LIMIT_MS: u64 = 450;
 const ENABLE_TRANSITION_TABLE: bool = true; // paired evaluation switch
 
+// Congestion-routing experiment. Costs are scaled by 100 to stay integral.
+const CONGESTION_BEAM: usize = 48;
+const CONGESTION_LAMBDA: i64 = 85;
+const CONGESTION_MU: i64 = 70;
+const CONGESTION_LOCK: i64 = 8_000;
+const CONGESTION_FREEDOM: i64 = 55;
+const CONGESTION_BONUS: i64 = 260;
+const CONGESTION_WINDOW: usize = 3;
+
 struct Scanner {
     input: io::Stdin,
     tokens: VecDeque<String>,
@@ -68,6 +77,19 @@ struct Route {
     tiles: Vec<(usize, u8)>,
     length: usize,
     bonuses: usize,
+}
+
+#[derive(Clone)]
+struct CongestionNode {
+    cell: usize,
+    enter: usize,
+    placed_cell: usize,
+    parent: usize,
+    orientation: u8,
+    length: usize,
+    rotations: i32,
+    cost: i64,
+    seen: Vec<u64>,
 }
 
 #[derive(Clone)]
@@ -1433,18 +1455,8 @@ fn search_rotations(board: &Board, orientation: &mut Vec<u8>, start: Instant, de
             let cell = cells[rng.usize(cells.len())];
             if undo.iter().any(|&(x, _)| x == cell) { continue; }
             let old = current[cell];
-            // On normal/large boards a +/-1 rotation preserves one of the tile's
-            // three connections. Tiny boards can exhaust the wider neighborhood,
-            // and restricting them caused a large reachability loss.
-            let new_o = if board.valid_count <= 80 {
-                let mut o = rng.usize(6) as u8;
-                if o == old { o = (o + 1) % 6; }
-                o
-            } else if rng.usize(2) == 0 {
-                (old + 1) % 6
-            } else {
-                (old + 5) % 6
-            };
+            let mut new_o = rng.usize(6) as u8;
+            if new_o == old { new_o = (new_o + 1) % 6; }
             undo.push((cell, old));
             proposed.push(new_o);
             if use_differential { affected |= differential.cell_masks[cell]; }
@@ -1626,6 +1638,22 @@ fn exit_cell_distance(board: &Board, a: usize, b: usize) -> usize {
     let dr = a as isize / board.W as isize - b as isize / board.W as isize;
     let dc = a as isize % board.W as isize - b as isize % board.W as isize;
     dr.unsigned_abs().max(dc.unsigned_abs()).max((dr + dc).unsigned_abs())
+}
+
+fn log_outer_three_capacity_bound(board: &Board) {
+    let outer_tiles = board.valid.iter().enumerate()
+        .filter(|(cell, valid)| **valid && board.boundary_depth[*cell] <= 3)
+        .count();
+    let capacity = 3 * outer_tiles;
+    let mut lower_bounds: Vec<usize> = board.pairs.iter()
+        .map(|pair| exit_cell_distance(board, pair[0], pair[1]) + 1)
+        .collect();
+    lower_bounds.sort_unstable_by_key(|&x| Reverse(x));
+    let drop = 3.min(lower_bounds.len());
+    let required: usize = lower_bounds[drop..].iter().sum();
+    eprintln!("outer3_bound pairs={} outer_tiles={} capacity={} shortest_sum_after_drop3={} feasible_by_capacity={} dropped={:?}",
+        board.pairs.len(), outer_tiles, capacity, required, required <= capacity,
+        &lower_bounds[..drop]);
 }
 
 fn minimum_wrong_pairing(
@@ -2446,6 +2474,409 @@ fn build_exits(N: usize, valid: &[bool]) -> (Vec<(usize, usize)>, Vec<i32>) {
     (exits, id)
 }
 
+fn reconstruct_congestion(arena: &[CongestionNode], mut id: usize) -> (Route, i64) {
+    let last = &arena[id];
+    let mut tiles = Vec::with_capacity(last.length);
+    loop {
+        let n = &arena[id];
+        if n.parent == usize::MAX { break; }
+        tiles.push((n.placed_cell, n.orientation));
+        id = n.parent;
+    }
+    tiles.reverse();
+    (Route { tiles, length: last.length, bonuses: 0 }, last.cost)
+}
+
+fn congestion_orientation_choices(
+    board: &Board, base: &[u8], cell: usize, enter: usize,
+) -> Vec<(usize, u8)> {
+    let mut best = [None::<(u8, i32)>; 6];
+    for o in 0..6u8 {
+        let out = paired_dir(o, enter);
+        let cost = rotation_cost(board.initial[cell], o)
+            + if o == base[cell] { 0 } else { 1 };
+        if best[out].map_or(true, |x| cost < x.1) {
+            best[out] = Some((o, cost));
+        }
+    }
+    IntoIterator::into_iter(best).enumerate()
+        .filter_map(|(out, x)| x.map(|(o, _)| (out, o))).collect()
+}
+
+fn congestion_route(
+    board: &Board, base: &[u8], usage: &[u8], locks: &[u8],
+    source: usize, target: usize, allow_break: bool, depth_limit: Option<usize>,
+    deadline: Instant,
+) -> Option<(Route, i64)> {
+    if Instant::now() >= deadline { return None; }
+    let (start_cell, start_side) = board.exits[source];
+    let target_cell = board.exits[target].0;
+    let words = (board.valid.len() + 63) / 64;
+    let root = CongestionNode {
+        cell: start_cell, enter: start_side, placed_cell: usize::MAX,
+        parent: usize::MAX, orientation: 255, length: 0, rotations: 0,
+        cost: 0, seen: vec![0; words],
+    };
+    let mut arena = vec![root];
+    let mut beam = vec![0usize];
+    let mut goals: Vec<(i64, usize)> = Vec::new();
+    let max_len = 5 * board.W + 24;
+    for _ in 0..max_len {
+        if beam.is_empty() || Instant::now() >= deadline { break; }
+        let mut next_beam = Vec::with_capacity(CONGESTION_BEAM * 4);
+        for &id in &beam {
+            let p = arena[id].clone();
+            if depth_limit.is_some_and(|limit| board.boundary_depth[p.cell] > limit) {
+                continue;
+            }
+            if bit_test(&p.seen, p.cell) { continue; }
+            let mut seen = p.seen.clone();
+            bit_set(&mut seen, p.cell);
+            let choices = if locks[p.cell] > 0 && !allow_break {
+                vec![(paired_dir(base[p.cell], p.enter), base[p.cell])]
+            } else {
+                congestion_orientation_choices(board, base, p.cell, p.enter)
+            };
+            for (out, o) in choices {
+                let used = usage[p.cell] as i64;
+                let rot = rotation_cost(board.initial[p.cell], o);
+                let changes_lock = i64::from(locks[p.cell] > 0 && o != base[p.cell]);
+                let step = 100
+                    + CONGESTION_LAMBDA * used
+                    + CONGESTION_MU * used * used
+                    + CONGESTION_FREEDOM * (locks[p.cell] as i64).saturating_sub(1)
+                    + CONGESTION_LOCK * locks[p.cell] as i64 * changes_lock
+                    + 35 * board.M as i64 * rot as i64
+                    + CONGESTION_BONUS * i64::from(board.bonus[p.cell]);
+                let node = CongestionNode {
+                    cell: p.cell, enter: p.enter, placed_cell: p.cell,
+                    parent: id, orientation: o, length: p.length + 1,
+                    rotations: p.rotations + rot, cost: p.cost + step,
+                    seen: seen.clone(),
+                };
+                if let Some((next, next_enter)) = board.next(p.cell, out) {
+                    if depth_limit.is_some_and(|limit| board.boundary_depth[next] > limit) {
+                        continue;
+                    }
+                    if bit_test(&node.seen, next) { continue; }
+                    let mut child = node;
+                    child.cell = next;
+                    child.enter = next_enter;
+                    let nid = arena.len();
+                    arena.push(child);
+                    next_beam.push(nid);
+                } else if board.exit_id[p.cell * 6 + out] as usize == target {
+                    let nid = arena.len();
+                    arena.push(node);
+                    goals.push((arena[nid].cost, nid));
+                }
+            }
+        }
+        next_beam.sort_unstable_by_key(|&id| {
+            let n = &arena[id];
+            let r = n.cell / board.W;
+            let c = n.cell % board.W;
+            let tr = target_cell / board.W;
+            let tc = target_cell % board.W;
+            let h = r.abs_diff(tr).max(c.abs_diff(tc)).max(
+                ((r as isize - tr as isize) + (c as isize - tc as isize)).unsigned_abs());
+            n.cost + 85 * h as i64
+        });
+        next_beam.truncate(CONGESTION_BEAM);
+        beam = next_beam;
+        if !goals.is_empty() { break; }
+    }
+    goals.into_iter().min_by_key(|x| x.0)
+        .map(|(_, id)| reconstruct_congestion(&arena, id))
+}
+
+fn apply_congestion_route(
+    orientation: &mut [u8], usage: &mut [u8], locks: &mut [u8], route: &Route,
+) {
+    for &(cell, o) in &route.tiles {
+        orientation[cell] = o;
+        usage[cell] = usage[cell].saturating_add(1).min(3);
+        locks[cell] = locks[cell].saturating_add(1).min(3);
+    }
+}
+
+fn refresh_outer_occupancy(
+    board: &Board, orientation: &[u8], hero: Option<usize>,
+    usage: &mut [u8], locks: &mut [u8], route_cells: &mut Vec<usize>,
+) -> Vec<usize> {
+    usage.fill(0);
+    locks.fill(0);
+    let mut unmatched = Vec::new();
+    for id in 0..board.pairs.len() {
+        if Some(id) == hero { continue; }
+        let pair = board.pairs[id];
+        let (end, _, _) = board.trace(orientation, pair[0]);
+        if end != pair[1] {
+            unmatched.push(id);
+            continue;
+        }
+        board.trace_exit_cells(orientation, pair[0], route_cells);
+        route_cells.sort_unstable();
+        route_cells.dedup();
+        for &cell in route_cells.iter() {
+            usage[cell] = usage[cell].saturating_add(1).min(3);
+            locks[cell] = locks[cell].saturating_add(1).min(3);
+        }
+    }
+    unmatched
+}
+
+fn outer_connection_metrics(board: &Board, orientation: &[u8]) -> (usize, usize, i32) {
+    let mut matched = 0usize;
+    for pair in &board.pairs {
+        if board.trace(orientation, pair[0]).0 == pair[1] { matched += 1; }
+    }
+    let mut seen = vec![false; board.exits.len()];
+    let mut invalid_length = 0usize;
+    for exit in 0..board.exits.len() {
+        if seen[exit] { continue; }
+        let (end, length, _) = board.trace(orientation, exit);
+        seen[exit] = true;
+        if end < seen.len() { seen[end] = true; }
+        let correct = board.pairs.iter().any(|pair| {
+            (pair[0] == exit && pair[1] == end) || (pair[1] == exit && pair[0] == end)
+        });
+        if !correct { invalid_length += length; }
+    }
+    let moves = orientation.iter().enumerate()
+        .filter(|(cell, _)| board.valid[*cell])
+        .map(|(cell, &o)| rotation_cost(board.initial[cell], o)).sum();
+    (matched, invalid_length, moves)
+}
+
+fn collect_unmatched_outer_cells(
+    board: &Board, orientation: &[u8], cells: &mut Vec<usize>, work: &mut Vec<usize>,
+) {
+    cells.clear();
+    for pair in &board.pairs {
+        if board.trace(orientation, pair[0]).0 == pair[1] { continue; }
+        for &exit in pair {
+            board.trace_exit_cells(orientation, exit, work);
+            cells.extend(work.iter().copied()
+                .filter(|&cell| board.boundary_depth[cell] <= 3));
+        }
+    }
+    cells.sort_unstable();
+    cells.dedup();
+}
+
+fn optimize_outer_connections(board: &Board, orientation: &mut Vec<u8>, deadline: Instant) {
+    let cells: Vec<usize> = (0..board.valid.len())
+        .filter(|&cell| board.valid[cell] && board.boundary_depth[cell] <= 3)
+        .collect();
+    if cells.is_empty() { return; }
+    let scalar = |x: (usize, usize, i32)| -> i64 {
+        5_000_000 * x.0 as i64 - 10_000 * x.1 as i64 - x.2 as i64
+    };
+    let mut rng = Rng(0x93e2_7c41_d851_6a0b ^ board.valid_count as u64);
+    let start = Instant::now();
+    let total = deadline.saturating_duration_since(start).as_secs_f64().max(1e-6);
+    let initial_metrics = outer_connection_metrics(board, orientation);
+    let mut current_value = scalar(initial_metrics);
+    let mut best_metrics = initial_metrics;
+    let mut best = orientation.clone();
+    let mut iterations = 0usize;
+    let mut critical = Vec::new();
+    let mut work = Vec::new();
+    collect_unmatched_outer_cells(board, orientation, &mut critical, &mut work);
+    while Instant::now() < deadline {
+        iterations += 1;
+        if iterations & 255 == 0 {
+            collect_unmatched_outer_cells(board, orientation, &mut critical, &mut work);
+        }
+        let cell = if !critical.is_empty() && rng.usize(100) < 85 {
+            critical[rng.usize(critical.len())]
+        } else {
+            cells[rng.usize(cells.len())]
+        };
+        let old = orientation[cell];
+        let mut next = rng.usize(5) as u8;
+        if next >= old { next += 1; }
+        orientation[cell] = next;
+        let metrics = outer_connection_metrics(board, orientation);
+        let value = scalar(metrics);
+        let progress = (start.elapsed().as_secs_f64() / total).clamp(0.0, 1.0);
+        let temp = 1_500_000.0_f64.powf(1.0 - progress) * 200.0_f64.powf(progress);
+        let delta = value - current_value;
+        if delta >= 0 || rng.unit() < (delta as f64 / temp).exp() {
+            current_value = value;
+            if (metrics.0, Reverse(metrics.1), Reverse(metrics.2))
+                > (best_metrics.0, Reverse(best_metrics.1), Reverse(best_metrics.2))
+            {
+                best_metrics = metrics;
+                best.clone_from(orientation);
+            }
+        } else {
+            orientation[cell] = old;
+        }
+    }
+    *orientation = best;
+    eprintln!("outer3_opt iterations={} matched={} unmatched={} invalid_length={} moves={}",
+        iterations, best_metrics.0, board.pairs.len() - best_metrics.0,
+        best_metrics.1, best_metrics.2);
+}
+
+fn construct_congestion_initial(
+    board: &Board, deadline: Instant,
+) -> Vec<u8> {
+    let mut orientation = board.initial.clone();
+    let mut usage = vec![0u8; board.valid.len()];
+    let mut locks = vec![0u8; board.valid.len()];
+    let mut best = orientation.clone();
+    let mut best_stats = board.evaluate(&best);
+    let hero = special_order(board).first().copied();
+    // The hero is the third temporarily unconnected original pair.  Ordinary
+    // outer routing must leave at most two additional pairs unresolved.
+    let abandon_target = 2usize.min(board.pairs.len().saturating_sub(1));
+    let mut route_cells = Vec::new();
+    let mut remaining = refresh_outer_occupancy(
+        board, &orientation, hero, &mut usage, &mut locks, &mut route_cells);
+    let mut routed = 0usize;
+    let mut attempts = 0usize;
+    let mut best_outer = orientation.clone();
+    let mut best_unmatched = remaining.len();
+    let normal_deadline = deadline.checked_sub(Duration::from_millis(3_000))
+        .unwrap_or(deadline);
+    let outer_opt_deadline = deadline.checked_sub(Duration::from_millis(1_600))
+        .unwrap_or(deadline);
+
+    while remaining.len() > abandon_target && Instant::now() < normal_deadline
+        && attempts < board.pairs.len() * 12
+    {
+        attempts += 1;
+        remaining.sort_unstable_by_key(|&id| {
+            let p = board.pairs[id];
+            let endpoint_pressure = usage[board.exits[p[0]].0] as usize
+                + usage[board.exits[p[1]].0] as usize;
+            exit_cell_distance(board, p[0], p[1]) * 100 + endpoint_pressure * 90
+        });
+        let window = CONGESTION_WINDOW.min(remaining.len());
+        let mut candidates = Vec::new();
+        for pos in 0..window {
+            if Instant::now() >= normal_deadline { break; }
+            let id = remaining[pos];
+            let pair = board.pairs[id];
+            let route_deadline = (Instant::now() + Duration::from_millis(8)).min(normal_deadline);
+            if let Some((route, cost)) = congestion_route(
+                board, &orientation, &usage, &locks, pair[0], pair[1], false,
+                Some(3), route_deadline,
+            ) {
+                candidates.push((cost, route.length, pos, id, route));
+            }
+        }
+        let selected = candidates.into_iter().min_by_key(|x| (x.0, x.1));
+        let (cost, _, _pos, id, route) = if let Some(x) = selected {
+            x
+        } else {
+            // Negotiated congestion: rip up only when no compatible route exists.
+            let id = remaining[0];
+            let pair = board.pairs[id];
+            let route_deadline = (Instant::now() + Duration::from_millis(14)).min(normal_deadline);
+            let Some((route, cost)) = congestion_route(
+                board, &orientation, &usage, &locks, pair[0], pair[1], true,
+                Some(3), route_deadline,
+            ) else {
+                remaining.rotate_left(1);
+                continue;
+            };
+            (cost, route.length, 0, id, route)
+        };
+        apply_congestion_route(&mut orientation, &mut usage, &mut locks, &route);
+        routed += 1;
+        remaining = refresh_outer_occupancy(
+            board, &orientation, hero, &mut usage, &mut locks, &mut route_cells);
+        let stats = board.evaluate(&orientation);
+        if remaining.len() < best_unmatched
+            || (remaining.len() == best_unmatched && stats.score > best_stats.score)
+        {
+            best_unmatched = remaining.len();
+            best_outer.clone_from(&orientation);
+            best_stats = stats;
+        }
+        if (stats.score, stats.matched, stats.total - board.M as i64 * stats.moves as i64)
+            > (best_stats.score, best_stats.matched,
+               best_stats.total - board.M as i64 * best_stats.moves as i64)
+        {
+            best_stats = stats;
+            best.clone_from(&orientation);
+        }
+        if routed % 16 == 0 {
+            eprintln!("congestion_progress routed={} remaining={} last_pair={} route_cost={} k={} score={}",
+                routed, remaining.len(), id, cost, stats.matched, stats.score);
+        }
+    }
+    orientation = best_outer;
+    optimize_outer_connections(board, &mut orientation, outer_opt_deadline);
+    remaining = refresh_outer_occupancy(
+        board, &orientation, hero, &mut usage, &mut locks, &mut route_cells);
+    best_unmatched = remaining.len();
+    let outer_fixed: Vec<i8> = locks.iter().enumerate().map(|(cell, &x)| {
+        if x >= 1 { orientation[cell] as i8 } else { -1 }
+    }).collect();
+    let outer_orientation = orientation.clone();
+    let specials = special_order(board);
+    let mut structured_orientation = orientation.clone();
+    let mut structured_stats = board.evaluate(&structured_orientation);
+    for count in 1..=3.min(specials.len()) {
+        if Instant::now() >= deadline { break; }
+        let trials_left = 4 - count;
+        let millis = deadline.saturating_duration_since(Instant::now()).as_millis() as u64;
+        let trial_deadline = (Instant::now()
+            + Duration::from_millis((millis / trials_left as u64).max(1))).min(deadline);
+        let chosen = &specials[..count];
+        let (candidate, special_t, done) = build_with_specials(
+            board, &outer_orientation, &outer_fixed, 3, chosen, trial_deadline,
+        );
+        let stats = board.evaluate(&candidate);
+        let eligible = stats.matched + 3 >= board.pairs.len();
+        let best_eligible = structured_stats.matched + 3 >= board.pairs.len();
+        eprintln!("congestion_special count={} done={} special_t={} eligible={} k={} t={} m={} score={}",
+            count, done, special_t, eligible, stats.matched, stats.total, stats.moves, stats.score);
+        if (eligible, stats.score, stats.matched,
+            stats.total - board.M as i64 * stats.moves as i64, Reverse(stats.moves))
+            > (best_eligible, structured_stats.score, structured_stats.matched,
+               structured_stats.total - board.M as i64 * structured_stats.moves as i64,
+               Reverse(structured_stats.moves))
+        {
+            structured_orientation = candidate;
+            structured_stats = stats;
+        }
+    }
+    orientation = structured_orientation;
+    remaining = refresh_outer_occupancy(
+        board, &orientation, None, &mut usage, &mut locks, &mut route_cells);
+    remaining.sort_unstable_by_key(|&id| Reverse(pair_priority(board, board.pairs[id])));
+    let abandoned: Vec<usize> = remaining.iter().copied().take(3).collect();
+
+    let virtual_pairs = minimum_wrong_pairing(board, &abandoned)
+        .map(|x| x.1).unwrap_or_default();
+    for pair in &virtual_pairs {
+        if Instant::now() >= deadline { break; }
+        if let Some((route, _)) = congestion_route(
+            board, &orientation, &usage, &locks, pair[0], pair[1], false,
+            Some(3), deadline,
+        ) {
+            apply_congestion_route(&mut orientation, &mut usage, &mut locks, &route);
+        } else if let Some((route, _)) = congestion_route(
+            board, &orientation, &usage, &locks, pair[0], pair[1], true,
+            Some(3), deadline,
+        ) {
+            apply_congestion_route(&mut orientation, &mut usage, &mut locks, &route);
+        }
+    }
+    let stats = board.evaluate(&orientation);
+    best_stats = stats;
+    eprintln!("congestion_done routed={} attempts={} outer_unmatched={} hero={:?} abandoned={:?} virtual_pairs={:?} k={} t={} m={} score={}",
+        routed, attempts, best_unmatched, hero, abandoned, virtual_pairs, best_stats.matched,
+        best_stats.total, best_stats.moves, best_stats.score);
+    orientation
+}
+
 fn construct_initial(
     board: &Board, phase_start: Instant, construction_deadline: Instant, label: &str,
 ) -> Vec<u8> {
@@ -2579,86 +3010,17 @@ fn main() {
     }
     let board = Board { W, M, initial: initial.clone(), valid, bonus, exits, exit_id,
         pairs, transition, boundary_depth, valid_count };
-    let requested_variant = std::env::var("MM166_VIRTUAL_R").ok()
-        .and_then(|x| x.parse::<usize>().ok());
-    let auto_variants = std::env::var("MM166_VIRTUAL_AUTO")
-        .map(|x| x != "0").unwrap_or(false);
-    // The three-start oracle is useful in long experiments, but its construction
-    // cost does not pay back inside ten seconds.  Keep baseline as production
-    // default and expose both experiments through environment variables.
-    let selected_mode = if auto_variants {
-        None
-    } else {
-        Some(requested_variant.unwrap_or(0))
-    };
-    let (mut best_orientation, mut best_stats, _solve_start, deadline, selected_variant) =
-        if let Some(virtual_r) = selected_mode {
-            let (construction_board, sacrificed, virtual_pairs, original_distance,
-                 virtual_distance, estimated_route_length) =
-                virtualized_construction_board(&board, virtual_r);
-            let solve_start = Instant::now();
-            let deadline = solve_start + Duration::from_millis(TIME_LIMIT_MS);
-            eprintln!("variant r={} sacrificed={:?} virtual_pairs={:?} original_distance={} virtual_distance={} estimated_route_length={} saved_distance={} route_saved={} selection_ms={}",
-                virtual_r, sacrificed, virtual_pairs, original_distance, virtual_distance,
-                estimated_route_length, original_distance.saturating_sub(virtual_distance),
-                original_distance.saturating_sub(estimated_route_length),
-                solve_start.duration_since(start).as_millis());
-            let construction_deadline =
-                (solve_start + Duration::from_millis(CONSTRUCTION_LIMIT_MS)).min(deadline);
-            let orientation = construct_initial(
-                &construction_board, solve_start, construction_deadline, "single");
-            let stats = board.evaluate(&orientation);
-            (orientation, stats, solve_start, deadline, virtual_r)
-        } else {
-            let v0 = (board.clone(), Vec::new(), Vec::new(), 0, 0, 0);
-            let v2 = virtualized_construction_board(&board, 2);
-            let v3 = virtualized_construction_board(&board, 3);
-            let variants = vec![(0usize, v0), (2usize, v2), (3usize, v3)];
-            let solve_start = Instant::now();
-            let deadline = solve_start + Duration::from_millis(TIME_LIMIT_MS);
-            // Keep the reliable baseline construction deep.  Virtual pairings are
-            // deliberately cheap probes; the winner still receives the common SA.
-            let construction_ms = [2_400u64, 700, 700];
-            let mut candidates: Vec<(usize, Vec<u8>, Stats)> = Vec::new();
-            for (at, (r, (construction_board, sacrificed, virtual_pairs,
-                          original_distance, virtual_distance, estimated_route_length)))
-                in variants.into_iter().enumerate()
-            {
-                let phase_start = Instant::now();
-                let phase_deadline = (phase_start
-                    + Duration::from_millis(construction_ms[at])).min(deadline);
-                eprintln!("auto_variant r={} sacrificed={:?} virtual_pairs={:?} original_distance={} virtual_distance={} estimated_route_length={} route_saved={}",
-                    r, sacrificed, virtual_pairs, original_distance, virtual_distance,
-                    estimated_route_length,
-                    original_distance.saturating_sub(estimated_route_length));
-                let orientation = construct_initial(
-                    &construction_board, phase_start, phase_deadline,
-                    if r == 0 { "r0" } else if r == 2 { "r2" } else { "r3" });
-                let stats = board.evaluate(&orientation);
-                candidates.push((r, orientation, stats));
-            }
-            for candidate in &mut candidates {
-                if Instant::now() >= deadline { break; }
-                let pilot_start = Instant::now();
-                let pilot_deadline = (pilot_start + Duration::from_millis(150)).min(deadline);
-                polish(&board, &mut candidate.1,
-                    (pilot_start + Duration::from_millis(20)).min(pilot_deadline));
-                search_rotations(&board, &mut candidate.1, Instant::now(), pilot_deadline);
-                candidate.2 = board.evaluate(&candidate.1);
-                eprintln!("auto_pilot r={} k={} t={} m={} score={}", candidate.0,
-                    candidate.2.matched, candidate.2.total,
-                    candidate.2.moves, candidate.2.score);
-            }
-            candidates.sort_unstable_by_key(|x| {
-                (Reverse(x.2.score), Reverse(x.2.matched),
-                 Reverse(x.2.total), x.2.moves)
-            });
-            let (r, orientation, stats) = candidates.into_iter().next().unwrap();
-            eprintln!("auto_selected r={} k={} t={} m={} score={} phase_elapsed_ms={}",
-                r, stats.matched, stats.total, stats.moves, stats.score,
-                solve_start.elapsed().as_millis());
-            (orientation, stats, solve_start, deadline, r)
-        };
+    if std::env::var("MM166_BOUND_ONLY").is_ok() {
+        log_outer_three_capacity_bound(&board);
+        println!("0");
+        return;
+    }
+    let solve_start = Instant::now();
+    let deadline = solve_start + Duration::from_millis(TIME_LIMIT_MS);
+    let construction_deadline =
+        (solve_start + Duration::from_millis(CONSTRUCTION_LIMIT_MS)).min(deadline);
+    let mut best_orientation = construct_congestion_initial(&board, construction_deadline);
+    let mut best_stats = board.evaluate(&best_orientation);
 
     if Instant::now() < deadline {
         polish(&board, &mut best_orientation, (Instant::now() + Duration::from_millis(100)).min(deadline));
@@ -2669,7 +3031,7 @@ fn main() {
         best_stats = board.evaluate(&best_orientation);
     }
     log_solution_diagnostics(&board, &best_orientation, best_stats);
-    eprintln!("final selected_r={} k={} t={} m={} score={} elapsed_ms={}", selected_variant,
+    eprintln!("final congestion k={} t={} m={} score={} elapsed_ms={}",
         best_stats.matched, best_stats.total, best_stats.moves, best_stats.score,
         start.elapsed().as_millis());
 
