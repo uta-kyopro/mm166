@@ -8,8 +8,10 @@ use std::time::{Duration, Instant};
 
 // Search parameters.
 const TIME_LIMIT_MS: u64 = 9_200;
+const OUTPUT_CONSTRUCTION_ONLY: bool = false;
 const NORMAL_BEAM: usize = 72;
 const NORMAL_BONUS_PENALTY: i64 = 300; // reserve bonus transitions for long paths
+const ENABLE_REVERSE_ROUTE_BFS: bool = true;
 const ENABLE_SHORT_ROUTE_DETOURS: bool = false;
 const ENABLE_DEFERRED_ROUTE_CHOICES: bool = false;
 const NORMAL_ROUTE_DETOUR_STEPS: usize = 2;
@@ -21,11 +23,20 @@ const MAX_SPECIAL: usize = 3;
 const LAYERED_MAX_SPECIAL: usize = 3;
 const OUTER_LAYERS: usize = 3;
 const ENABLE_LAYERED_BOARD_BEAM: bool = true;
-const LAYERED_BOARD_BEAM_WIDTH: usize = 8;
+const ENABLE_FULL_BOARD_CONSTRUCTION_BEAM: bool = true;
+const ENABLE_TREE_BOARD_BEAM: bool = true;
+const COMPLETE_TREE_BOARD_BEAM: bool = true;
+const COMPLETE_TREE_BOARD_BEAM_SAFETY_MS: u64 = 60_000;
+const LAYERED_BOARD_BEAM_WIDTH: usize = 10;
 const LAYERED_DEFERRED_RESERVED_STATES: usize = 0;
 const LAYERED_ROUTE_CANDIDATES: usize = 4;
 const LAYERED_DEFERRED_CHOICES: usize = 1;
 const LAYERED_DEFERRED_ASSIGNMENTS: usize = 4;
+const ENABLE_SECOND_CONSTRUCTION_BEAM: bool = true;
+const SECOND_CONSTRUCTION_BEAM_WIDTH: usize = 8;
+const SECOND_CONSTRUCTION_ROUTE_CANDIDATES: usize = 4;
+const SECOND_CONSTRUCTION_UNMATCHED: usize = 3;
+const SECOND_CONSTRUCTION_LONG_PAIRS: usize = 6;
 const CONSTRUCTION_LIMIT_MS: u64 = 4_500;
 const LAYERED_OUTER_LIMIT_MS: u64 = 700;
 const LAYERED_SPECIAL_LIMIT_MS: u64 = 600;
@@ -43,6 +54,7 @@ const CONNECT_REPAIR_BEAM: usize = 96;
 const CONNECT_REPAIR_TARGETS: usize = 10;
 const MULTITILE_CHOICE_LIMIT: usize = 24;
 const COMPACT_REPRESENTATIVES: usize = 1;
+const ENABLE_COMPACT_SA: bool = true;
 const COMPACT_SA_START_TEMP: f64 = 2_000_000.0;
 const COMPACT_SA_END_TEMP: f64 = 100.0;
 const MULTI_TRUNK_LNS_HEROES: usize = 2;
@@ -143,6 +155,13 @@ struct EvalScratch {
     epoch: u32,
 }
 
+struct ReverseBfsScratch {
+    distance: Vec<usize>,
+    stamp: Vec<u32>,
+    epoch: u32,
+    queue: Vec<usize>,
+}
+
 #[derive(Clone, Copy)]
 struct CompactMetrics {
     energy: i64,
@@ -181,6 +200,35 @@ impl EvalScratch {
             self.epoch = 1;
         }
         self.epoch
+    }
+}
+
+impl ReverseBfsScratch {
+    fn new(states: usize) -> Self {
+        Self {
+            distance: vec![0; states],
+            stamp: vec![0; states],
+            epoch: 0,
+            queue: Vec::with_capacity(states),
+        }
+    }
+
+    fn begin(&mut self, states: usize) -> u32 {
+        if self.distance.len() < states {
+            self.distance.resize(states, 0);
+            self.stamp.resize(states, 0);
+        }
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.stamp.fill(0);
+            self.epoch = 1;
+        }
+        self.queue.clear();
+        self.epoch
+    }
+
+    fn reached(&self, state: usize, epoch: u32) -> bool {
+        self.stamp[state] == epoch
     }
 }
 
@@ -696,6 +744,61 @@ fn route_rank(
     }
 }
 
+fn reverse_route_distances(
+    board: &Board,
+    fixed: &[u8],
+    target: usize,
+    depth_limit: Option<usize>,
+    scratch: &mut ReverseBfsScratch,
+) -> u32 {
+    let epoch = scratch.begin(board.valid.len() * 6);
+    let (target_cell, target_side) = board.exits[target];
+    if depth_limit.is_some_and(|limit| board.boundary_depth[target_cell] > limit) {
+        return epoch;
+    }
+    for enter in 0..6 {
+        let can_exit = (0..6u8).any(|orientation| {
+            fixed[target_cell] >> orientation & 1 != 0
+                && paired_dir(orientation, enter) == target_side
+        });
+        if can_exit {
+            let state = target_cell * 6 + enter;
+            scratch.stamp[state] = epoch;
+            scratch.distance[state] = 1;
+            scratch.queue.push(state);
+        }
+    }
+    let mut head = 0usize;
+    while head < scratch.queue.len() {
+        let state = scratch.queue[head];
+        head += 1;
+        let cell = state / 6;
+        let enter = state % 6;
+        let Some((previous_cell, previous_out)) = board.next(cell, enter) else {
+            continue;
+        };
+        if depth_limit.is_some_and(|limit| board.boundary_depth[previous_cell] > limit) {
+            continue;
+        }
+        for previous_enter in 0..6 {
+            let can_reach = (0..6u8).any(|orientation| {
+                fixed[previous_cell] >> orientation & 1 != 0
+                    && paired_dir(orientation, previous_enter) == previous_out
+            });
+            if !can_reach {
+                continue;
+            }
+            let previous_state = previous_cell * 6 + previous_enter;
+            if scratch.stamp[previous_state] != epoch {
+                scratch.stamp[previous_state] = epoch;
+                scratch.distance[previous_state] = scratch.distance[state] + 1;
+                scratch.queue.push(previous_state);
+            }
+        }
+    }
+    epoch
+}
+
 fn reconstruct(arena: &[Node], mut id: usize) -> Route {
     let last = &arena[id];
     let mut tiles = Vec::with_capacity(last.length);
@@ -728,7 +831,7 @@ fn assigned_domain(arena: &[Node], mut id: usize, cell: usize) -> Option<u8> {
     }
 }
 
-fn find_routes(
+fn find_routes_with_reverse_scratch(
     board: &Board,
     base: &[u8],
     fixed: &[u8],
@@ -740,6 +843,7 @@ fn find_routes(
     depth_limit: Option<usize>,
     deadline: Instant,
     candidate_limit: usize,
+    reverse_scratch: &mut ReverseBfsScratch,
 ) -> Vec<Route> {
     if Instant::now() >= deadline {
         return Vec::new();
@@ -753,6 +857,14 @@ fn find_routes(
             <= NORMAL_ROUTE_DETOUR_MAX_DISTANCE;
     let n = (board.W + 1) / 2;
     let port_revisit = special && n <= 13;
+    let reverse_epoch = (ENABLE_REVERSE_ROUTE_BFS && !special).then(|| {
+        reverse_route_distances(board, fixed, target, depth_limit, reverse_scratch)
+    });
+    if reverse_epoch.is_some_and(|epoch| {
+        !reverse_scratch.reached(start_cell * 6 + start_side, epoch)
+    }) {
+        return Vec::new();
+    }
     let words = (board.valid.len() * if port_revisit { 6 } else { 1 } + 63) / 64;
     let root = Node {
         cell: start_cell,
@@ -857,6 +969,11 @@ fn find_routes(
                     let mut child = node;
                     child.cell = nc;
                     child.enter = ne;
+                    if reverse_epoch.is_some_and(|epoch| {
+                        !reverse_scratch.reached(nc * 6 + ne, epoch)
+                    }) {
+                        continue;
+                    }
                     let nid = arena.len();
                     arena.push(child);
                     next_beam.push(nid);
@@ -935,6 +1052,36 @@ fn find_routes(
         }
     }
     routes
+}
+
+fn find_routes(
+    board: &Board,
+    base: &[u8],
+    fixed: &[u8],
+    source: usize,
+    target: usize,
+    width: usize,
+    special: bool,
+    damage: Option<&DamageModel>,
+    depth_limit: Option<usize>,
+    deadline: Instant,
+    candidate_limit: usize,
+) -> Vec<Route> {
+    let mut reverse_scratch = ReverseBfsScratch::new(board.valid.len() * 6);
+    find_routes_with_reverse_scratch(
+        board,
+        base,
+        fixed,
+        source,
+        target,
+        width,
+        special,
+        damage,
+        depth_limit,
+        deadline,
+        candidate_limit,
+        &mut reverse_scratch,
+    )
 }
 
 fn find_route(
@@ -1274,6 +1421,324 @@ fn optimistic_reachable_pairs(board: &Board, fixed: &[u8]) -> Vec<bool> {
         .collect()
 }
 
+#[derive(Clone, Copy)]
+struct TreeBoardChange {
+    cell: usize,
+    old_orientation: u8,
+    new_orientation: u8,
+    old_domain: u8,
+    new_domain: u8,
+}
+
+struct TreeBoardNode {
+    parent: usize,
+    depth: usize,
+    pair_id: usize,
+    changes: Vec<TreeBoardChange>,
+}
+
+struct TreeBoardState {
+    orientation: Vec<u8>,
+    fixed: Vec<u8>,
+    connected: Vec<bool>,
+    rotated_tile_count: usize,
+    rotation_lower_bound: i32,
+}
+
+#[derive(Clone)]
+struct TreeBoardCandidate {
+    node: usize,
+    connected_count: usize,
+    optimistic_count: usize,
+    route_length: usize,
+    rotated_tile_count: usize,
+    rotation_lower_bound: i32,
+    layer_counts: [usize; OUTER_LAYERS],
+}
+
+fn tree_board_set_cell(
+    board: &Board,
+    state: &mut TreeBoardState,
+    cell: usize,
+    orientation: u8,
+    domain: u8,
+) {
+    state.rotated_tile_count -= usize::from(state.orientation[cell] != board.initial[cell]);
+    state.rotation_lower_bound -= board.domain_rotation[cell][state.fixed[cell] as usize];
+    state.orientation[cell] = orientation;
+    state.fixed[cell] = domain;
+    state.rotated_tile_count += usize::from(orientation != board.initial[cell]);
+    state.rotation_lower_bound += board.domain_rotation[cell][domain as usize];
+}
+
+fn tree_board_apply_node(board: &Board, state: &mut TreeBoardState, node: &TreeBoardNode) {
+    for change in &node.changes {
+        debug_assert_eq!(state.orientation[change.cell], change.old_orientation);
+        debug_assert_eq!(state.fixed[change.cell], change.old_domain);
+        tree_board_set_cell(
+            board,
+            state,
+            change.cell,
+            change.new_orientation,
+            change.new_domain,
+        );
+    }
+    state.connected[node.pair_id] = true;
+}
+
+fn tree_board_revert_node(board: &Board, state: &mut TreeBoardState, node: &TreeBoardNode) {
+    state.connected[node.pair_id] = false;
+    for change in node.changes.iter().rev() {
+        debug_assert_eq!(state.orientation[change.cell], change.new_orientation);
+        debug_assert_eq!(state.fixed[change.cell], change.new_domain);
+        tree_board_set_cell(
+            board,
+            state,
+            change.cell,
+            change.old_orientation,
+            change.old_domain,
+        );
+    }
+}
+
+fn tree_board_move_to(
+    board: &Board,
+    state: &mut TreeBoardState,
+    nodes: &[TreeBoardNode],
+    current: &mut usize,
+    target: usize,
+) {
+    if *current == target {
+        return;
+    }
+    let mut from = *current;
+    let mut to = target;
+    let mut apply_path = Vec::new();
+    while nodes[from].depth > nodes[to].depth {
+        tree_board_revert_node(board, state, &nodes[from]);
+        from = nodes[from].parent;
+    }
+    while nodes[to].depth > nodes[from].depth {
+        apply_path.push(to);
+        to = nodes[to].parent;
+    }
+    while from != to {
+        tree_board_revert_node(board, state, &nodes[from]);
+        from = nodes[from].parent;
+        apply_path.push(to);
+        to = nodes[to].parent;
+    }
+    for &node in apply_path.iter().rev() {
+        tree_board_apply_node(board, state, &nodes[node]);
+    }
+    *current = target;
+}
+
+fn tree_board_route_node(
+    state: &TreeBoardState,
+    parent: usize,
+    pair_id: usize,
+    route: &Route,
+    keep_domains: bool,
+    parent_depth: usize,
+) -> TreeBoardNode {
+    let mut changes = Vec::with_capacity(route.tiles.len());
+    for &(cell, new_orientation, required_domain) in &route.tiles {
+        // Ordinary route search never revisits a cell, so each delta can read
+        // its parent value directly without a temporary board copy or map.
+        let old_orientation = state.orientation[cell];
+        let old_domain = state.fixed[cell];
+        let new_domain = if keep_domains {
+            old_domain & required_domain
+        } else {
+            1 << new_orientation
+        };
+        changes.push(TreeBoardChange {
+            cell,
+            old_orientation,
+            new_orientation,
+            old_domain,
+            new_domain,
+        });
+    }
+    TreeBoardNode {
+        parent,
+        depth: parent_depth + 1,
+        pair_id,
+        changes,
+    }
+}
+
+fn run_tree_board_beam(
+    board: &Board,
+    orientation: Vec<u8>,
+    fixed: Vec<u8>,
+    connected: Vec<bool>,
+    initial_layer_counts: [usize; OUTER_LAYERS],
+    order: &[usize],
+    keep_domains: bool,
+    deadline: Instant,
+) -> (Vec<u8>, Vec<u8>, [usize; OUTER_LAYERS]) {
+    let started = Instant::now();
+    let search_deadline = if COMPLETE_TREE_BOARD_BEAM {
+        started + Duration::from_millis(COMPLETE_TREE_BOARD_BEAM_SAFETY_MS)
+    } else {
+        deadline
+    };
+    let reachable = optimistic_reachable_pairs(board, &fixed);
+    let rotated_tile_count = board
+        .valid_cells
+        .iter()
+        .filter(|&&cell| orientation[cell] != board.initial[cell])
+        .count();
+    let rotation_lower_bound = board
+        .valid_cells
+        .iter()
+        .map(|&cell| board.domain_rotation[cell][fixed[cell] as usize])
+        .sum();
+    let mut state = TreeBoardState {
+        orientation,
+        fixed,
+        connected,
+        rotated_tile_count,
+        rotation_lower_bound,
+    };
+    let mut nodes = vec![TreeBoardNode {
+        parent: usize::MAX,
+        depth: 0,
+        pair_id: usize::MAX,
+        changes: Vec::new(),
+    }];
+    let mut beam = vec![TreeBoardCandidate {
+        node: 0,
+        connected_count: state.connected.iter().filter(|&&value| value).count(),
+        optimistic_count: reachable.iter().filter(|&&value| value).count(),
+        route_length: 0,
+        rotated_tile_count: state.rotated_tile_count,
+        rotation_lower_bound: state.rotation_lower_bound,
+        layer_counts: initial_layer_counts,
+    }];
+    let rank = |candidate: &TreeBoardCandidate| {
+        Reverse((
+            candidate.connected_count,
+            Reverse(candidate.route_length),
+            Reverse(candidate.rotated_tile_count),
+            candidate.optimistic_count,
+            Reverse(candidate.rotation_lower_bound),
+        ))
+    };
+    let mut current = 0usize;
+    let mut reachability_calls = 1usize;
+    let mut expanded = 0usize;
+    let mut reverse_scratch = ReverseBfsScratch::new(board.valid.len() * 6);
+
+    'layers: for layer in 0..OUTER_LAYERS {
+        for &id in order {
+            if Instant::now() >= search_deadline {
+                break 'layers;
+            }
+            let pair = board.pairs[id];
+            let mut next_beam = Vec::with_capacity(
+                beam.len() * (LAYERED_ROUTE_CANDIDATES + 1),
+            );
+            for candidate in &beam {
+                tree_board_move_to(
+                    board,
+                    &mut state,
+                    &nodes,
+                    &mut current,
+                    candidate.node,
+                );
+                next_beam.push(candidate.clone());
+                if state.connected[id] || Instant::now() >= search_deadline {
+                    continue;
+                }
+                let routes = find_routes_with_reverse_scratch(
+                    board,
+                    &state.orientation,
+                    &state.fixed,
+                    pair[0],
+                    pair[1],
+                    if ENABLE_FULL_BOARD_CONSTRUCTION_BEAM { board.W } else { layer + 1 },
+                    false,
+                    None,
+                    if ENABLE_FULL_BOARD_CONSTRUCTION_BEAM { None } else { Some(layer) },
+                    search_deadline,
+                    LAYERED_ROUTE_CANDIDATES,
+                    &mut reverse_scratch,
+                );
+                if routes.is_empty() {
+                    continue;
+                }
+                let shortest = routes.iter().map(|route| route.length).min().unwrap();
+                let before = optimistic_reachable_pairs(board, &state.fixed);
+                reachability_calls += 1;
+                for route in routes.into_iter().filter(|route| route.length == shortest) {
+                    let node = tree_board_route_node(
+                        &state,
+                        candidate.node,
+                        id,
+                        &route,
+                        keep_domains,
+                        nodes[candidate.node].depth,
+                    );
+                    tree_board_apply_node(board, &mut state, &node);
+                    let after = optimistic_reachable_pairs(board, &state.fixed);
+                    reachability_calls += 1;
+                    let keeps_future_open = (0..board.pairs.len()).all(|other| {
+                        state.connected[other]
+                            || other == id
+                            || !before[other]
+                            || after[other]
+                    });
+                    let child_rotated_tile_count = state.rotated_tile_count;
+                    let child_rotation_lower_bound = state.rotation_lower_bound;
+                    tree_board_revert_node(board, &mut state, &node);
+                    if keeps_future_open {
+                        let next_node = nodes.len();
+                        nodes.push(node);
+                        let mut layer_counts = candidate.layer_counts;
+                        layer_counts[layer] += 1;
+                        next_beam.push(TreeBoardCandidate {
+                            node: next_node,
+                            connected_count: candidate.connected_count + 1,
+                            optimistic_count: after.iter().filter(|&&value| value).count(),
+                            route_length: candidate.route_length + route.length,
+                            rotated_tile_count: child_rotated_tile_count,
+                            rotation_lower_bound: child_rotation_lower_bound,
+                            layer_counts,
+                        });
+                        expanded += 1;
+                    }
+                }
+            }
+            next_beam.sort_unstable_by_key(rank);
+            next_beam.truncate(LAYERED_BOARD_BEAM_WIDTH);
+            beam = next_beam;
+        }
+    }
+    beam.sort_unstable_by_key(rank);
+    let chosen = beam.first().expect("empty tree board beam").clone();
+    tree_board_move_to(
+        board,
+        &mut state,
+        &nodes,
+        &mut current,
+        chosen.node,
+    );
+    eprintln!(
+        "tree_board_beam nodes={} expanded={} reachability={} k={} segments={} rotated={} rotation_lb={} elapsed_ms={}",
+        nodes.len(), expanded, reachability_calls, chosen.connected_count,
+        chosen.route_length, state.rotated_tile_count, state.rotation_lower_bound,
+        started.elapsed().as_millis(),
+    );
+    (
+        state.orientation,
+        state.fixed,
+        chosen.layer_counts,
+    )
+}
+
 fn build_layered_with_specials(
     board: &Board,
     reserved: &[usize],
@@ -1302,7 +1767,28 @@ fn build_layered_with_specials(
         .filter(|id| !reserved.contains(id))
         .collect();
     order.sort_unstable_by_key(|&id| ordinary_pair_priority(board, board.pairs[id]));
-    if ENABLE_LAYERED_BOARD_BEAM {
+    if ENABLE_LAYERED_BOARD_BEAM
+        && ENABLE_TREE_BOARD_BEAM
+        && !ENABLE_DEFERRED_ROUTE_CHOICES
+    {
+        let (next_orientation, next_fixed, next_layer_counts) =
+            run_tree_board_beam(
+                board,
+                orientation,
+                fixed,
+                connected,
+                layer_counts,
+                &order,
+                keep_domains,
+                outer_deadline,
+            );
+        orientation = next_orientation;
+        fixed = next_fixed;
+        layer_counts = next_layer_counts;
+    } else if ENABLE_LAYERED_BOARD_BEAM {
+        let cloned_beam_started = Instant::now();
+        let mut cloned_beam_reachability_calls = 1usize;
+        let mut cloned_beam_expanded = 0usize;
         #[derive(Clone)]
         struct LayeredBeamState {
             orientation: Vec<u8>,
@@ -1313,6 +1799,7 @@ fn build_layered_with_specials(
             optimistic_count: usize,
             route_length: usize,
             detour_count: usize,
+            rotated_tile_count: usize,
             rotation_lower_bound: i32,
             deferred: Vec<DeferredRouteChoice>,
         }
@@ -1323,8 +1810,16 @@ fn build_layered_with_specials(
                 .map(|&cell| board.domain_rotation[cell][domains[cell] as usize])
                 .sum()
         };
+        let rotated_tile_count = |orientations: &[u8]| -> usize {
+            board
+                .valid_cells
+                .iter()
+                .filter(|&&cell| orientations[cell] != board.initial[cell])
+                .count()
+        };
         let reachable = optimistic_reachable_pairs(board, &fixed);
         let initial_rotation_lower_bound = rotation_lower_bound(&fixed);
+        let initial_rotated_tile_count = rotated_tile_count(&orientation);
         let mut beam = vec![LayeredBeamState {
             orientation,
             fixed,
@@ -1334,6 +1829,7 @@ fn build_layered_with_specials(
             layer_counts,
             route_length: 0,
             detour_count: 0,
+            rotated_tile_count: initial_rotated_tile_count,
             rotation_lower_bound: initial_rotation_lower_bound,
             deferred: Vec::new(),
         }];
@@ -1358,10 +1854,18 @@ fn build_layered_with_specials(
                         &state.fixed,
                         pair[0],
                         pair[1],
-                        layer + 1,
+                        if ENABLE_FULL_BOARD_CONSTRUCTION_BEAM {
+                            board.W
+                        } else {
+                            layer + 1
+                        },
                         false,
                         None,
-                        Some(layer),
+                        if ENABLE_FULL_BOARD_CONSTRUCTION_BEAM {
+                            None
+                        } else {
+                            Some(layer)
+                        },
                         outer_deadline,
                         LAYERED_ROUTE_CANDIDATES,
                     );
@@ -1393,6 +1897,7 @@ fn build_layered_with_specials(
                         }
                     }
                     let before = optimistic_reachable_pairs(board, &state.fixed);
+                    cloned_beam_reachability_calls += 1;
                     for route in routes
                         .into_iter()
                         .filter(|route| !has_detour || route.length == shortest_length)
@@ -1405,6 +1910,7 @@ fn build_layered_with_specials(
                             keep_domains,
                         );
                         let after = optimistic_reachable_pairs(board, &candidate.fixed);
+                        cloned_beam_reachability_calls += 1;
                         let keeps_future_open = (0..board.pairs.len()).all(|other| {
                             state.connected[other]
                                 || other == id
@@ -1429,17 +1935,20 @@ fn build_layered_with_specials(
                         candidate.layer_counts[layer] += 1;
                         candidate.route_length += route.length;
                         candidate.detour_count += usize::from(route.length > shortest_length);
+                        candidate.rotated_tile_count = rotated_tile_count(&candidate.orientation);
                         candidate.rotation_lower_bound = rotation_lower_bound(&candidate.fixed);
                         next_beam.push(candidate);
+                        cloned_beam_expanded += 1;
                     }
                 }
                 let beam_rank = |state: &LayeredBeamState| {
-                    Reverse(
-                        state.connected_count as i64 * 1_000_000_000
-                            + state.optimistic_count as i64 * 1_000_000
-                            - state.route_length as i64 * 1_000
-                            - state.rotation_lower_bound as i64,
-                    )
+                    Reverse((
+                        state.connected_count,
+                        Reverse(state.route_length),
+                        Reverse(state.rotated_tile_count),
+                        state.optimistic_count,
+                        Reverse(state.rotation_lower_bound),
+                    ))
                 };
                 next_beam.sort_unstable_by_key(beam_rank);
                 let mut regular_states = Vec::new();
@@ -1561,6 +2070,12 @@ fn build_layered_with_specials(
         layer_counts = chosen_layers;
         selected_detours = detours;
         }
+        eprintln!(
+            "cloned_board_beam expanded={} reachability={} elapsed_ms={}",
+            cloned_beam_expanded,
+            cloned_beam_reachability_calls,
+            cloned_beam_started.elapsed().as_millis(),
+        );
     } else {
         for layer in 0..OUTER_LAYERS {
             for &id in &order {
@@ -1606,6 +2121,11 @@ fn build_layered_with_specials(
         }
     }
 
+    let special_deadline = if ENABLE_TREE_BOARD_BEAM && COMPLETE_TREE_BOARD_BEAM {
+        Instant::now() + Duration::from_millis(LAYERED_SPECIAL_LIMIT_MS)
+    } else {
+        special_deadline
+    };
     let mut special_value = 0i64;
     let mut special_done = 0usize;
     for (index, &id) in reserved.iter().enumerate() {
@@ -4019,6 +4539,183 @@ fn build_exits(N: usize, valid: &[bool]) -> (Vec<(usize, usize)>, Vec<i32>) {
     (exits, id)
 }
 
+fn second_construction_beam(
+    board: &Board,
+    base_orientation: &[u8],
+    deadline: Instant,
+) -> Vec<u8> {
+    let started = Instant::now();
+    let mut scratch = EvalScratch::new(board.valid.len());
+    let differential = DifferentialEval::new(board, base_orientation, &mut scratch);
+    let initial = board.evaluate_with_scratch(base_orientation, &mut scratch);
+
+    let mut unmatched: Vec<usize> = (0..board.pairs.len())
+        .filter(|&id| differential.contribution[id] == 0)
+        .collect();
+    unmatched.sort_unstable_by_key(|&id| ordinary_pair_priority(board, board.pairs[id]));
+    unmatched.truncate(SECOND_CONSTRUCTION_UNMATCHED);
+
+    let mut long_pairs: Vec<(usize, usize, usize)> = Vec::new();
+    for id in 0..board.pairs.len() {
+        if differential.contribution[id] == 0 {
+            continue;
+        }
+        let (_, length) = board.trace_pair(base_orientation, id, &mut scratch, None);
+        long_pairs.push((length as usize, pair_distance(board, board.pairs[id]), id));
+    }
+    long_pairs.sort_unstable_by_key(|&(length, distance, id)| {
+        (Reverse(length.saturating_sub(distance)), Reverse(length), id)
+    });
+    long_pairs.truncate(SECOND_CONSTRUCTION_LONG_PAIRS);
+
+    let assign_count = unmatched.len().min(long_pairs.len());
+    unmatched.truncate(assign_count);
+    if assign_count == 0 || Instant::now() >= deadline {
+        eprintln!(
+            "second_construct virtual_pairs=0 unmatched={} long={} accepted=false elapsed_ms={}",
+            unmatched.len(), long_pairs.len(), started.elapsed().as_millis()
+        );
+        return base_orientation.to_vec();
+    }
+
+    // Assign each unmatched pair to a long pair by the shortest virtual wrong
+    // connection: min((u0-l0)+(u1-l1), (u0-l1)+(u1-l0)).
+    let long_count = long_pairs.len();
+    let mut dp: Vec<Option<(usize, Vec<(usize, usize, bool, usize)>)>> =
+        vec![None; 1usize << long_count];
+    dp[0] = Some((0, Vec::new()));
+    for &unmatched_id in &unmatched {
+        let mut next: Vec<Option<(usize, Vec<(usize, usize, bool, usize)>)>> =
+            vec![None; 1usize << long_count];
+        for mask in 0..(1usize << long_count) {
+            let Some((base_cost, assignment)) = dp[mask].as_ref() else { continue };
+            for long_index in 0..long_count {
+                if mask >> long_index & 1 != 0 { continue; }
+                let long_id = long_pairs[long_index].2;
+                let u = board.pairs[unmatched_id];
+                let l = board.pairs[long_id];
+                let straight = pair_distance(board, [u[0], l[0]])
+                    + pair_distance(board, [u[1], l[1]]);
+                let crossed = pair_distance(board, [u[0], l[1]])
+                    + pair_distance(board, [u[1], l[0]]);
+                let (wrong_cost, flip) = if crossed < straight {
+                    (crossed, true)
+                } else {
+                    (straight, false)
+                };
+                let new_mask = mask | (1usize << long_index);
+                let new_cost = base_cost + wrong_cost;
+                if next[new_mask].as_ref().is_none_or(|entry| new_cost < entry.0) {
+                    let mut new_assignment = assignment.clone();
+                    new_assignment.push((unmatched_id, long_id, flip, wrong_cost));
+                    next[new_mask] = Some((new_cost, new_assignment));
+                }
+            }
+        }
+        dp = next;
+    }
+    let Some((virtual_cost, assignment)) = dp.into_iter().flatten().min_by_key(|x| x.0)
+    else { return base_orientation.to_vec() };
+
+    let mut selected_mask = 0u128;
+    let mut order = Vec::with_capacity(assignment.len() * 2);
+    for &(unmatched_id, _, _, _) in &assignment {
+        selected_mask |= 1u128 << unmatched_id;
+        order.push(unmatched_id);
+    }
+    for &(_, long_id, _, _) in &assignment {
+        selected_mask |= 1u128 << long_id;
+        order.push(long_id);
+    }
+
+    let mut protected_domains = vec![0u8; board.valid.len()];
+    for &cell in &board.valid_cells { protected_domains[cell] = ALL_ORIENTATIONS; }
+    // Keep all non-selected matched paths as strand domains. Their other two
+    // strands remain available to the second construction.
+    for id in 0..board.pairs.len() {
+        if differential.contribution[id] <= 0 || selected_mask >> id & 1 != 0 { continue; }
+        let (mut cell, mut enter) = board.exits[board.pairs[id][0]];
+        for _ in 0..=3 * board.valid_count {
+            let out = paired_dir(base_orientation[cell], enter);
+            let mut required = 0u8;
+            for o in 0..6u8 {
+                if paired_dir(o, enter) == out { required |= 1 << o; }
+            }
+            protected_domains[cell] &= required;
+            if protected_domains[cell] == 0 { return base_orientation.to_vec(); }
+            let Some((next, next_enter)) = board.next(cell, out) else { break };
+            cell = next;
+            enter = next_enter;
+        }
+    }
+
+    #[derive(Clone)]
+    struct SecondBeamState {
+        orientation: Vec<u8>,
+        domains: Vec<u8>,
+        routed: usize,
+        route_length: usize,
+        stats: Stats,
+    }
+    let mut beam = vec![SecondBeamState {
+        orientation: base_orientation.to_vec(),
+        domains: protected_domains,
+        routed: 0,
+        route_length: 0,
+        stats: initial,
+    }];
+    let mut reverse_scratch = ReverseBfsScratch::new(board.valid.len() * 6);
+    for &id in &order {
+        if Instant::now() >= deadline { break; }
+        let mut next_beam = Vec::with_capacity(
+            beam.len() * (SECOND_CONSTRUCTION_ROUTE_CANDIDATES + 1),
+        );
+        for state in beam.into_iter() {
+            next_beam.push(state.clone());
+            if Instant::now() >= deadline { continue; }
+            let pair = board.pairs[id];
+            let routes = find_routes_with_reverse_scratch(
+                board, &state.orientation, &state.domains,
+                pair[0], pair[1], OUTER_LAYERS, false, None, None,
+                deadline, SECOND_CONSTRUCTION_ROUTE_CANDIDATES,
+                &mut reverse_scratch,
+            );
+            if routes.is_empty() { continue; }
+            let shortest = routes.iter().map(|route| route.length).min().unwrap();
+            for route in routes.into_iter().filter(|route| route.length == shortest) {
+                let mut candidate = state.clone();
+                apply_route(&mut candidate.orientation, &mut candidate.domains, &route, true);
+                candidate.routed += 1;
+                candidate.route_length += route.length;
+                candidate.stats = board.evaluate_with_scratch(&candidate.orientation, &mut scratch);
+                next_beam.push(candidate);
+            }
+        }
+        next_beam.sort_unstable_by_key(|state| Reverse((
+            state.stats.score,
+            state.stats.matched,
+            state.routed,
+            Reverse(state.route_length),
+            Reverse(state.stats.moves),
+        )));
+        next_beam.truncate(SECOND_CONSTRUCTION_BEAM_WIDTH);
+        beam = next_beam;
+    }
+
+    let best = beam.into_iter().max_by_key(|state| state.stats.quality())
+        .expect("empty second construction beam");
+    let accepted = best.stats.matched > initial.matched
+        && best.stats.score > initial.score
+        && board.tester_safe(&best.orientation);
+    eprintln!(
+        "second_construct virtual_pairs={} virtual_cost={} assignment={:?} routed={} k={}->{} score_delta={} accepted={} elapsed_ms={}",
+        assignment.len(), virtual_cost, assignment, best.routed,
+        initial.matched, best.stats.matched, best.stats.score - initial.score,
+        accepted, started.elapsed().as_millis()
+    );
+    if accepted { best.orientation } else { base_orientation.to_vec() }
+}
+
 fn construct_initial(
     board: &Board,
     phase_start: Instant,
@@ -4118,6 +4815,18 @@ fn construct_initial(
                     best_orientation = candidate;
                 }
             }
+        }
+    }
+    if ENABLE_SECOND_CONSTRUCTION_BEAM && Instant::now() < construction_deadline {
+        let second = second_construction_beam(
+            board,
+            &best_orientation,
+            construction_deadline,
+        );
+        let stats = board.evaluate(&second);
+        if stats.score > best_stats.score && board.tester_safe(&second) {
+            best_stats = stats;
+            best_orientation = second;
         }
     }
     eprintln!(
@@ -4261,7 +4970,7 @@ fn main() {
     let mut best_orientation =
         construct_initial(&board, solve_start, construction_deadline, "main");
     let mut best_stats = board.evaluate(&best_orientation);
-    if Instant::now() < deadline {
+    if !OUTPUT_CONSTRUCTION_ONLY && Instant::now() < deadline {
         polish(
             &board,
             &mut best_orientation,
@@ -4281,7 +4990,23 @@ fn main() {
             board.M as f64 * before_reallocation.moves as f64
                 / before_reallocation.total.max(1) as f64
         );
-        if use_compact {
+        if !ENABLE_COMPACT_SA {
+            if !use_compact {
+                let lns_deadline = (compact_start
+                    + Duration::from_millis(MULTI_TRUNK_LNS_LIMIT_MS))
+                .min(deadline);
+                multi_trunk_lns(
+                    &board,
+                    &mut best_orientation,
+                    compact_start,
+                    lns_deadline,
+                );
+            }
+            eprintln!(
+                "reallocation_select kind={} compact_disabled=true",
+                if use_compact { "rotation_only" } else { "multi_trunk_lns" }
+            );
+        } else if use_compact {
             compact_paths_sa(
                 &board,
                 &mut best_orientation,
