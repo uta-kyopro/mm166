@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 // Search parameters are kept here so experiments use one visible configuration.
 const TIME_LIMIT_MS: u64 = 9_200;
 const NORMAL_BEAM: usize = 72;
+const NORMAL_BONUS_PENALTY: i64 = 300; // reserve bonus transitions for long paths
 const SPECIAL_BEAM: usize = 192;
 const SPECIAL_CANDIDATES: usize = 24;
 const WIDTHS: [usize; 3] = [1, 2, 3];
@@ -27,7 +28,7 @@ const CONNECT_REPAIR_BEAM: usize = 48;
 const CONNECT_REPAIR_TARGETS: usize = 10;
 const ENABLE_CONNECT_REPAIR: bool = true; // paired evaluation switch
 const SA_START_TEMP: f64 = 240.0;
-const SA_END_TEMP: f64 = 1.0;
+const SA_END_TEMP: f64 = 0.01;
 const POSTPROCESS_LIMIT_MS: u64 = 450;
 const ENABLE_TRANSITION_TABLE: bool = true; // paired evaluation switch
 
@@ -451,6 +452,7 @@ fn route_rank(
         -(24 * node.length as i64
             + 10 * board.M as i64 * node.rotations as i64
             + 30 * node.depth_sum as i64
+            + NORMAL_BONUS_PENALTY * node.bonuses as i64
             + 220 * (overflow * overflow) as i64
             + 14 * heuristic)
     }
@@ -1530,6 +1532,7 @@ fn log_solution_diagnostics(board: &Board, orientation: &[u8], stats: Stats) {
     let mut matched_length = 0i64;
     let mut total_bonus_uses = 0i64;
     let mut weighted = Vec::new();
+    let mut matched_details = Vec::new();
     for id in 0..board.pairs.len() {
         route_cells.clear();
         let (value, length) = board.trace_pair(
@@ -1563,6 +1566,8 @@ fn log_solution_diagnostics(board: &Board, orientation: &[u8], stats: Stats) {
         }
         matched_length += length;
         total_bonus_uses += bonuses;
+        matched_details.push((id, board.pairs[id][0], board.pairs[id][1],
+            length, bonuses, value));
         if bonuses == bonus_count as i64 {
             full_bonus_paths += 1;
             full_bonus_length += length;
@@ -1594,6 +1599,125 @@ fn log_solution_diagnostics(board: &Board, orientation: &[u8], stats: Stats) {
     eprintln!("bonus_gap groups={:?} near_full_top={:?} missing_d12_length={:?} bonus_visits={:?} bonus_users={:?}",
         gap_groups, &near_full[..near_full.len().min(12)], missing_d12_length,
         bonus_visits, bonus_users);
+    eprintln!("score_breakdown k={} t={} rotation_moves={} M={} rotation_penalty={} q={} score={} formula={}*({}-{})",
+        stats.matched, stats.total, stats.moves, board.M,
+        board.M as i64 * stats.moves as i64, q, stats.score,
+        stats.matched, stats.total, board.M as i64 * stats.moves as i64);
+    eprintln!("matched_path_details fields=(pair_id,exit_a,exit_b,length,bonuses,value) count={} paths={:?}",
+        matched_details.len(), matched_details);
+    log_segment_decomposition(board, orientation, stats, matched_length);
+}
+
+fn log_segment_decomposition(
+    board: &Board, orientation: &[u8], stats: Stats, expected_matched_segments: i64,
+) {
+    let capacity = 3 * board.valid_count;
+    let terminal_base = board.valid.len() * 6;
+    let mut mate = vec![usize::MAX; board.exits.len()];
+    for pair in &board.pairs {
+        mate[pair[0]] = pair[1];
+        mate[pair[1]] = pair[0];
+    }
+    let mut exit_done = vec![false; board.exits.len()];
+    // 0=unseen, 1=matched terminal path, 2=invalid terminal path, 3=internal loop.
+    // A segment is keyed by the smaller of its two local ports.
+    let mut category = vec![0u8; board.valid.len() * 6];
+    let mut matched_segments = 0usize;
+    let mut invalid_segments = 0usize;
+    let mut invalid_paths = Vec::new();
+
+    for start in 0..board.exits.len() {
+        if exit_done[start] { continue; }
+        let (cell, enter) = board.exits[start];
+        let mut state = cell * 6 + enter;
+        let mut segments = Vec::new();
+        let mut bonus_seen = vec![false; board.valid.len()];
+        let mut bonuses = 0usize;
+        let mut end = usize::MAX;
+        for _ in 0..=capacity {
+            let cell = state / 6;
+            let enter = state % 6;
+            let out = paired_dir(orientation[cell], enter);
+            let key = cell * 6 + enter.min(out);
+            segments.push(key);
+            if board.bonus[cell] && !bonus_seen[cell] {
+                bonus_seen[cell] = true;
+                bonuses += 1;
+            }
+            let next = board.transition[state * 6 + orientation[cell] as usize];
+            if next >= terminal_base {
+                end = next - terminal_base;
+                break;
+            }
+            state = next;
+        }
+        assert!(end < board.exits.len());
+        exit_done[start] = true;
+        exit_done[end] = true;
+        let matched = mate[start] == end;
+        let potential_value = (segments.len() * (bonuses + 1)) as i64;
+        let code = if matched { 1 } else { 2 };
+        for &key in &segments {
+            assert!(category[key] == 0);
+            category[key] = code;
+        }
+        if matched {
+            matched_segments += segments.len();
+        } else {
+            invalid_segments += segments.len();
+            invalid_paths.push((start, end, mate[start], mate[end],
+                segments.len(), bonuses, potential_value));
+        }
+    }
+
+    let mut loops = Vec::new();
+    let mut loop_segments = 0usize;
+    for cell in 0..board.valid.len() {
+        if !board.valid[cell] { continue; }
+        for enter in 0..6 {
+            let out = paired_dir(orientation[cell], enter);
+            let first_key = cell * 6 + enter.min(out);
+            if category[first_key] != 0 { continue; }
+            let start_state = cell * 6 + enter;
+            let mut state = start_state;
+            let mut length = 0usize;
+            let mut bonus_seen = vec![false; board.valid.len()];
+            let mut bonuses = 0usize;
+            loop {
+                let cell = state / 6;
+                let enter = state % 6;
+                let out = paired_dir(orientation[cell], enter);
+                let key = cell * 6 + enter.min(out);
+                if category[key] == 3 { break; }
+                assert!(category[key] == 0);
+                category[key] = 3;
+                length += 1;
+                if board.bonus[cell] && !bonus_seen[cell] {
+                    bonus_seen[cell] = true;
+                    bonuses += 1;
+                }
+                let next = board.transition[state * 6 + orientation[cell] as usize];
+                assert!(next < terminal_base);
+                state = next;
+                if state == start_state { break; }
+            }
+            loop_segments += length;
+            loops.push((length, bonuses, length * (bonuses + 1)));
+        }
+    }
+    loops.sort_unstable_by_key(|x| Reverse(x.0));
+    invalid_paths.sort_unstable_by_key(|x| Reverse(x.4));
+    let unused_segments = invalid_segments + loop_segments;
+    assert_eq!(matched_segments + unused_segments, capacity);
+    assert_eq!(matched_segments as i64, expected_matched_segments);
+    eprintln!("segment_breakdown capacity={} strictly_unassigned_segments=0 matched_segments={} invalid_connection_segments={} loop_segments={} reclaimable_segments={} unused_for_score={} unused_ratio={:.6} matched_ratio={:.6} matched_paths={} invalid_paths={} loops={} stats_matched={}",
+        capacity, matched_segments, invalid_segments, loop_segments, unused_segments, unused_segments,
+        unused_segments as f64 / capacity.max(1) as f64,
+        matched_segments as f64 / capacity.max(1) as f64,
+        stats.matched, invalid_paths.len(), loops.len(), stats.matched);
+    eprintln!("invalid_connection_details fields=(exit_a,exit_b,expected_a,expected_b,length,bonuses,potential_value) paths={:?}",
+        invalid_paths);
+    eprintln!("internal_loop_details fields=(length,bonuses,potential_value) loops={:?}", loops);
 }
 
 fn region_signature(board: &Board, cells: &[usize], local: &[u8]) -> Vec<u8> {
@@ -1741,6 +1865,16 @@ fn improve_by_transition_tables(
     let mut visited = 0usize;
     let mut tested_by_size = [0usize; 5];
     let mut accepted_by_size = [0usize; 5];
+    let mut nontrivial_hits = 0usize;
+    let mut raw_alternatives = 0usize;
+    let mut pareto_alternatives = 0usize;
+    let mut current_dominated = 0usize;
+    let mut positive_candidates = 0usize;
+    let mut improving_regions = 0usize;
+    let mut delta_moves_by_size = [0i64; 5];
+    let mut delta_total_by_size = [0i64; 5];
+    let mut delta_score_by_size = [0i64; 5];
+    let mut accepted_kind = [0usize; 3]; // rotation-only, value gain, tradeoff/other
     let mut updates = Vec::new();
     let mut route_cells = Vec::new();
     for cells in &regions {
@@ -1763,6 +1897,8 @@ fn improve_by_transition_tables(
         }
         let group = &tables[&geometry][current_code];
         if group.len() <= 1 { continue; }
+        nontrivial_hits += 1;
+        raw_alternatives += group.len() - 1;
         let mut options = Vec::new();
         for &raw in group {
             let mut code = raw as usize;
@@ -1774,6 +1910,7 @@ fn improve_by_transition_tables(
             options.push((raw, moves, lengths, bonuses, local));
         }
         let mut pareto = Vec::new();
+        let mut current_is_dominated = false;
         for i in 0..options.len() {
             let dominated = (0..options.len()).any(|j| i != j
                 && options[j].1 <= options[i].1
@@ -1781,8 +1918,14 @@ fn improve_by_transition_tables(
                 && options[j].3.iter().zip(&options[i].3).all(|(a, b)| a | b == *a)
                 && (options[j].1 < options[i].1
                     || options[j].2 != options[i].2 || options[j].3 != options[i].3));
+            if options[i].0 as usize == current_code && dominated {
+                current_is_dominated = true;
+            }
             if !dominated { pareto.push(i); }
         }
+        if current_is_dominated { current_dominated += 1; }
+        pareto_alternatives += pareto.iter()
+            .filter(|&&i| options[i].0 as usize != current_code).count();
         let mut affected = 0u128;
         let mut old_local_moves = 0i32;
         for &cell in cells {
@@ -1798,6 +1941,9 @@ fn improve_by_transition_tables(
             let moves = stats.moves - old_local_moves + options[i].1;
             let candidate = differential.proposal(
                 board, orientation, stats, moves, affected, &mut scratch, &mut updates);
+            if candidate.matched == stats.matched && candidate.score > stats.score {
+                positive_candidates += 1;
+            }
             if candidate.matched == stats.matched && candidate.score > stats.score
                 && best.as_ref().map_or(true, |x| candidate.score > x.0.score)
             {
@@ -1807,6 +1953,16 @@ fn improve_by_transition_tables(
             if Instant::now() >= deadline { break; }
         }
         if let Some((next, local, best_updates)) = best {
+            improving_regions += 1;
+            let dm = next.moves as i64 - stats.moves as i64;
+            let dt = next.total - stats.total;
+            let ds = next.score - stats.score;
+            delta_moves_by_size[cells.len()] += dm;
+            delta_total_by_size[cells.len()] += dt;
+            delta_score_by_size[cells.len()] += ds;
+            if dt == 0 && dm < 0 { accepted_kind[0] += 1; }
+            else if dt > 0 { accepted_kind[1] += 1; }
+            else { accepted_kind[2] += 1; }
             for (at, &cell) in cells.iter().enumerate() { orientation[cell] = local[at]; }
             differential.commit(
                 board, orientation, &mut scratch, &best_updates, &mut route_cells);
@@ -1822,6 +1978,10 @@ fn improve_by_transition_tables(
         regions.len(), visited, tables.len(), tested, &tested_by_size[2..], accepted,
         &accepted_by_size[2..], stats.moves - initial.moves,
         stats.total - initial.total, stats.score - initial.score, started.elapsed().as_millis());
+    eprintln!("transition_table_usage nontrivial_hits={} raw_alternatives={} pareto_alternatives={} current_dominated={} positive_candidates={} improving_regions={} accepted_kind={:?} delta_moves_by_size={:?} delta_total_by_size={:?} delta_score_by_size={:?}",
+        nontrivial_hits, raw_alternatives, pareto_alternatives, current_dominated,
+        positive_candidates, improving_regions, accepted_kind, &delta_moves_by_size[2..],
+        &delta_total_by_size[2..], &delta_score_by_size[2..]);
     accepted
 }
 
