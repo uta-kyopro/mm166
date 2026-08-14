@@ -31,6 +31,13 @@ const SA_START_TEMP: f64 = 240.0;
 const SA_END_TEMP: f64 = 0.01;
 const POSTPROCESS_LIMIT_MS: u64 = 450;
 const ENABLE_TRANSITION_TABLE: bool = true; // paired evaluation switch
+const MIN_LONG_PAIRS_FOR_VIRTUALIZATION: usize = 5;
+const LONG_PAIR_DISTANCE_NUM: usize = 1;
+const LONG_PAIR_DISTANCE_DEN: usize = 1;
+const VIRTUAL_PAIRING_BEAM: usize = 192;
+const VIRTUAL_GROUP_CANDIDATES: usize = 48;
+const VIRTUAL_GAIN_COEFF_NUM: usize = 1;
+const VIRTUAL_GAIN_COEFF_DEN: usize = 1;
 
 struct Scanner {
     input: io::Stdin,
@@ -2416,6 +2423,206 @@ fn virtualized_construction_board(
     (virtual_board, selected, virtual_pairs, original, short, route_length)
 }
 
+fn minimum_virtual_cycle(
+    board: &Board, ids: &[usize],
+) -> (usize, Vec<[usize; 2]>) {
+    debug_assert!((2..=4).contains(&ids.len()));
+    let mut order = vec![ids[0]];
+    let mut used = vec![false; ids.len()];
+    used[0] = true;
+    let mut best = (usize::MAX, Vec::new());
+    fn enumerate_orders(
+        board: &Board, ids: &[usize], used: &mut [bool], order: &mut Vec<usize>,
+        best: &mut (usize, Vec<[usize; 2]>),
+    ) {
+        if order.len() == ids.len() {
+            for mask in 0..1usize << order.len() {
+                let oriented: Vec<[usize; 2]> = order.iter().enumerate().map(|(at, &id)| {
+                    let p = board.pairs[id];
+                    if (mask >> at) & 1 == 0 { p } else { [p[1], p[0]] }
+                }).collect();
+                let mut cost = 0usize;
+                let mut virtual_pairs = Vec::with_capacity(order.len());
+                for at in 0..oriented.len() {
+                    let edge = [oriented[at][1], oriented[(at + 1) % oriented.len()][0]];
+                    cost += exit_cell_distance(board, edge[0], edge[1]) + 1;
+                    virtual_pairs.push(edge);
+                }
+                if cost < best.0 {
+                    *best = (cost, virtual_pairs);
+                }
+            }
+            return;
+        }
+        for at in 1..ids.len() {
+            if used[at] { continue; }
+            used[at] = true;
+            order.push(ids[at]);
+            enumerate_orders(board, ids, used, order, best);
+            order.pop();
+            used[at] = false;
+        }
+    }
+    enumerate_orders(board, ids, &mut used, &mut order, &mut best);
+    best
+}
+
+fn beam_long_cycle_construction_board(
+    board: &Board, threshold_num: usize, threshold_den: usize,
+) -> (Board, Vec<usize>, Vec<[usize; 2]>, usize, usize, usize) {
+    let radius = (board.W + 1) / 2;
+    let threshold = (radius * threshold_num + threshold_den - 1) / threshold_den;
+    let mut long_ids: Vec<usize> = (0..board.pairs.len())
+        .filter(|&id| {
+            let p = board.pairs[id];
+            exit_cell_distance(board, p[0], p[1]) >= threshold
+        })
+        .collect();
+    long_ids.sort_unstable_by_key(|&id| {
+        let p = board.pairs[id];
+        Reverse(exit_cell_distance(board, p[0], p[1]))
+    });
+    if long_ids.len() < MIN_LONG_PAIRS_FOR_VIRTUALIZATION {
+        eprintln!("long_virtual disabled threshold={} long_pairs={} minimum={}",
+            threshold, long_ids.len(), MIN_LONG_PAIRS_FOR_VIRTUALIZATION);
+        return (board.clone(), Vec::new(), Vec::new(), 0, 0, 0);
+    }
+
+    #[derive(Clone)]
+    struct PairingState {
+        active: Vec<usize>,
+        sacrificed: Vec<usize>,
+        virtual_pairs: Vec<[usize; 2]>,
+        cycle_sizes: Vec<usize>,
+        original_distance: usize,
+        virtual_distance: usize,
+    }
+
+    let initial_long_count = long_ids.len();
+    let hero_id = long_ids[0];
+    let bonus_count = board.bonus.iter().filter(|&&x| x).count();
+    let segment_capacity = 3 * board.valid_count;
+    let shortest_sum: usize = board.pairs.iter().map(|p| {
+        exit_cell_distance(board, p[0], p[1]) + 1
+    }).sum();
+    let hero_pair = board.pairs[hero_id];
+    let hero_shortest = exit_cell_distance(board, hero_pair[0], hero_pair[1]) + 1;
+    let estimated_hero_length = segment_capacity.saturating_sub(shortest_sum)
+        .saturating_add(hero_shortest);
+    let estimated_rotation_penalty = board.M.max(0) as usize * board.valid_count / 3;
+    let estimated_q = segment_capacity
+        .saturating_add(bonus_count * estimated_hero_length)
+        .saturating_sub(estimated_rotation_penalty).max(1);
+    let coeff_num = std::env::var("MM166_VIRTUAL_GAIN_COEFF_NUM").ok()
+        .and_then(|x| x.parse().ok()).unwrap_or(VIRTUAL_GAIN_COEFF_NUM);
+    let coeff_den = std::env::var("MM166_VIRTUAL_GAIN_COEFF_DEN").ok()
+        .and_then(|x| x.parse().ok()).unwrap_or(VIRTUAL_GAIN_COEFF_DEN).max(1);
+
+    let mut best_choice: Option<(i128, i128, PairingState)> = None;
+    // Keep the longest pair as the hero.  For every prefix beginning at the
+    // second-longest pair, find the cheapest 2--4-cycle decomposition by Beam.
+    for sacrifice_target in 2..initial_long_count {
+        if sacrifice_target >= board.pairs.len() { break; }
+        let mut beam = vec![PairingState {
+            active: long_ids[1..=sacrifice_target].to_vec(),
+            sacrificed: Vec::new(),
+            virtual_pairs: Vec::new(),
+            cycle_sizes: Vec::new(),
+            original_distance: 0,
+            virtual_distance: 0,
+        }];
+        while beam.iter().any(|s| !s.active.is_empty()) {
+            let mut next = Vec::new();
+            let current = std::mem::take(&mut beam);
+            for state in current {
+                if state.active.is_empty() {
+                    next.push(state);
+                    continue;
+                }
+                let first = state.active[0];
+                let mut groups: Vec<(usize, Reverse<usize>, Vec<usize>, Vec<[usize; 2]>)> = Vec::new();
+                let mut add_group = |group: Vec<usize>| {
+                    let old_cost: usize = group.iter().map(|&id| {
+                        let p = board.pairs[id];
+                        exit_cell_distance(board, p[0], p[1]) + 1
+                    }).sum();
+                    let (cost, vp) = minimum_virtual_cycle(board, &group);
+                    groups.push((cost * 12 / group.len(), Reverse(old_cost), group, vp));
+                };
+                for b in 1..state.active.len() {
+                    add_group(vec![first, state.active[b]]);
+                    for c in b + 1..state.active.len() {
+                        add_group(vec![first, state.active[b], state.active[c]]);
+                        for d in c + 1..state.active.len() {
+                            add_group(vec![first, state.active[b], state.active[c], state.active[d]]);
+                        }
+                    }
+                }
+                groups.sort_unstable_by_key(|x| (x.0, x.1, x.2.clone()));
+                groups.truncate(VIRTUAL_GROUP_CANDIDATES);
+                for (_, Reverse(old_cost), group, vp) in groups {
+                    let mut child = state.clone();
+                    child.active.retain(|id| !group.contains(id));
+                    child.sacrificed.extend(group.iter().copied());
+                    child.virtual_pairs.extend(vp.iter().copied());
+                    child.cycle_sizes.push(group.len());
+                    child.original_distance += old_cost;
+                    child.virtual_distance += vp.iter().map(|p| {
+                        exit_cell_distance(board, p[0], p[1]) + 1
+                    }).sum::<usize>();
+                    next.push(child);
+                }
+            }
+            if next.is_empty() { break; }
+            next.sort_unstable_by_key(|s| {
+                let done = s.sacrificed.len().max(1);
+                (s.virtual_distance * sacrifice_target / done,
+                 s.virtual_distance,
+                 Reverse(s.original_distance.saturating_sub(s.virtual_distance)))
+            });
+            next.truncate(VIRTUAL_PAIRING_BEAM);
+            beam = next;
+        }
+        beam.retain(|s| s.active.is_empty()
+            && s.sacrificed.len() == sacrifice_target);
+        beam.sort_unstable_by_key(|s| s.virtual_distance);
+        let Some(candidate) = beam.into_iter().next() else { continue; };
+        let saved = candidate.original_distance.saturating_sub(candidate.virtual_distance);
+        let remaining_k = board.pairs.len() - sacrifice_target;
+        let adjusted_gain_num = coeff_num as i128 * saved as i128
+            * bonus_count as i128 * remaining_k as i128;
+        let connection_loss_num = coeff_den as i128 * sacrifice_target as i128
+            * estimated_q as i128;
+        let margin_num = adjusted_gain_num - connection_loss_num;
+        let normalized_margin = margin_num * 1_000_000 / remaining_k as i128;
+        eprintln!("long_virtual_candidate hero={} r={} cycles={:?} saved={} gain={} loss={} margin_num={} coeff={}/{}",
+            hero_id, sacrifice_target, candidate.cycle_sizes, saved,
+            saved * bonus_count, sacrifice_target * estimated_q / remaining_k.max(1),
+            margin_num, coeff_num, coeff_den);
+        if margin_num > 0 && best_choice.as_ref().map_or(true, |x| normalized_margin > x.0) {
+            best_choice = Some((normalized_margin, margin_num, candidate));
+        }
+    }
+    let Some((_, best_margin, best)) = best_choice else {
+        eprintln!("long_virtual rejected threshold={} long_pairs={} hero={} B={} estimated_q={} coeff={}/{}",
+            threshold, initial_long_count, hero_id, bonus_count, estimated_q,
+            coeff_num, coeff_den);
+        return (board.clone(), Vec::new(), Vec::new(), 0, 0, 0);
+    };
+
+    let mut virtual_board = board.clone();
+    for (&id, &edge) in best.sacrificed.iter().zip(&best.virtual_pairs) {
+            virtual_board.pairs[id] = edge;
+    }
+    eprintln!("long_virtual threshold={} initial_long={} hero={} cycle_sizes={:?} sacrificed={} original_distance={} virtual_distance={} saved={} estimated_q={} B={} margin_num={} coeff={}/{}",
+        threshold, initial_long_count, hero_id, best.cycle_sizes, best.sacrificed.len(),
+        best.original_distance, best.virtual_distance,
+        best.original_distance.saturating_sub(best.virtual_distance), estimated_q,
+        bonus_count, best_margin, coeff_num, coeff_den);
+    (virtual_board, best.sacrificed, best.virtual_pairs, best.original_distance,
+        best.virtual_distance, best.virtual_distance)
+}
+
 fn build_exits(N: usize, valid: &[bool]) -> (Vec<(usize, usize)>, Vec<i32>) {
     let W = 2 * N - 1;
     let inside = |r: isize, c: isize| r >= 0 && c >= 0 && r < W as isize && c < W as isize
@@ -2583,6 +2790,12 @@ fn main() {
         .and_then(|x| x.parse::<usize>().ok());
     let auto_variants = std::env::var("MM166_VIRTUAL_AUTO")
         .map(|x| x != "0").unwrap_or(false);
+    let disable_long_virtual = std::env::var("MM166_DISABLE_LONG_VIRTUAL")
+        .map(|x| x != "0").unwrap_or(false);
+    let long_threshold_num = std::env::var("MM166_LONG_THRESHOLD_NUM").ok()
+        .and_then(|x| x.parse().ok()).unwrap_or(LONG_PAIR_DISTANCE_NUM);
+    let long_threshold_den = std::env::var("MM166_LONG_THRESHOLD_DEN").ok()
+        .and_then(|x| x.parse().ok()).unwrap_or(LONG_PAIR_DISTANCE_DEN).max(1);
     // The three-start oracle is useful in long experiments, but its construction
     // cost does not pay back inside ten seconds.  Keep baseline as production
     // default and expose both experiments through environment variables.
@@ -2594,8 +2807,13 @@ fn main() {
     let (mut best_orientation, mut best_stats, _solve_start, deadline, selected_variant) =
         if let Some(virtual_r) = selected_mode {
             let (construction_board, sacrificed, virtual_pairs, original_distance,
-                 virtual_distance, estimated_route_length) =
-                virtualized_construction_board(&board, virtual_r);
+                 virtual_distance, estimated_route_length) = if virtual_r == 0
+                    && !disable_long_virtual {
+                beam_long_cycle_construction_board(
+                    &board, long_threshold_num, long_threshold_den)
+            } else {
+                virtualized_construction_board(&board, virtual_r)
+            };
             let solve_start = Instant::now();
             let deadline = solve_start + Duration::from_millis(TIME_LIMIT_MS);
             eprintln!("variant r={} sacrificed={:?} virtual_pairs={:?} original_distance={} virtual_distance={} estimated_route_length={} saved_distance={} route_saved={} selection_ms={}",
@@ -2610,7 +2828,12 @@ fn main() {
             let stats = board.evaluate(&orientation);
             (orientation, stats, solve_start, deadline, virtual_r)
         } else {
-            let v0 = (board.clone(), Vec::new(), Vec::new(), 0, 0, 0);
+            let v0 = if disable_long_virtual {
+                (board.clone(), Vec::new(), Vec::new(), 0, 0, 0)
+            } else {
+                beam_long_cycle_construction_board(
+                    &board, long_threshold_num, long_threshold_den)
+            };
             let v2 = virtualized_construction_board(&board, 2);
             let v3 = virtualized_construction_board(&board, 3);
             let variants = vec![(0usize, v0), (2usize, v2), (3usize, v3)];
