@@ -10,12 +10,22 @@ use std::time::{Duration, Instant};
 const TIME_LIMIT_MS: u64 = 9_200;
 const NORMAL_BEAM: usize = 72;
 const NORMAL_BONUS_PENALTY: i64 = 300; // reserve bonus transitions for long paths
+const ENABLE_SHORT_ROUTE_DETOURS: bool = false;
+const ENABLE_DEFERRED_ROUTE_CHOICES: bool = false;
+const NORMAL_ROUTE_DETOUR_STEPS: usize = 2;
+const NORMAL_ROUTE_DETOUR_MAX_DISTANCE: usize = 3;
 const SPECIAL_BEAM: usize = 192;
 const SPECIAL_CANDIDATES: usize = 24;
 const WIDTHS: [usize; 3] = [1, 2, 3];
 const MAX_SPECIAL: usize = 3;
 const LAYERED_MAX_SPECIAL: usize = 3;
 const OUTER_LAYERS: usize = 3;
+const ENABLE_LAYERED_BOARD_BEAM: bool = true;
+const LAYERED_BOARD_BEAM_WIDTH: usize = 8;
+const LAYERED_DEFERRED_RESERVED_STATES: usize = 0;
+const LAYERED_ROUTE_CANDIDATES: usize = 4;
+const LAYERED_DEFERRED_CHOICES: usize = 1;
+const LAYERED_DEFERRED_ASSIGNMENTS: usize = 4;
 const CONSTRUCTION_LIMIT_MS: u64 = 4_500;
 const LAYERED_OUTER_LIMIT_MS: u64 = 700;
 const LAYERED_SPECIAL_LIMIT_MS: u64 = 600;
@@ -35,6 +45,11 @@ const MULTITILE_CHOICE_LIMIT: usize = 24;
 const COMPACT_REPRESENTATIVES: usize = 1;
 const COMPACT_SA_START_TEMP: f64 = 2_000_000.0;
 const COMPACT_SA_END_TEMP: f64 = 100.0;
+const MULTI_TRUNK_LNS_HEROES: usize = 2;
+const MULTI_TRUNK_LNS_VICTIMS: usize = 4;
+const MULTI_TRUNK_LNS_HERO_PERCENT: u32 = 65;
+const MULTI_TRUNK_LNS_LIMIT_MS: u64 = 150;
+const ENABLE_MULTI_TRUNK_LNS: bool = true;
 const SA_START_TEMP: f64 = 240.0;
 const SA_END_TEMP: f64 = 0.01;
 const POSTPROCESS_LIMIT_MS: u64 = 450;
@@ -92,6 +107,13 @@ struct Route {
     tiles: Vec<(usize, u8, u8)>,
     length: usize,
     bonuses: usize,
+}
+
+#[derive(Clone)]
+struct DeferredRouteChoice {
+    layer: usize,
+    shortest_length: usize,
+    routes: Vec<Route>,
 }
 
 #[derive(Clone)]
@@ -706,7 +728,7 @@ fn assigned_domain(arena: &[Node], mut id: usize, cell: usize) -> Option<u8> {
     }
 }
 
-fn find_route(
+fn find_routes(
     board: &Board,
     base: &[u8],
     fixed: &[u8],
@@ -717,12 +739,18 @@ fn find_route(
     damage: Option<&DamageModel>,
     depth_limit: Option<usize>,
     deadline: Instant,
-) -> Option<Route> {
+    candidate_limit: usize,
+) -> Vec<Route> {
     if Instant::now() >= deadline {
-        return None;
+        return Vec::new();
     }
     let (start_cell, start_side) = board.exits[source];
     let target_cell = board.exits[target].0;
+    let allow_short_detours = ENABLE_SHORT_ROUTE_DETOURS
+        && !special
+        && candidate_limit > 1
+        && hex_cell_distance(board.W, start_cell, target_cell)
+            <= NORMAL_ROUTE_DETOUR_MAX_DISTANCE;
     let n = (board.W + 1) / 2;
     let port_revisit = special && n <= 13;
     let words = (board.valid.len() * if port_revisit { 6 } else { 1 } + 63) / 64;
@@ -752,7 +780,8 @@ fn find_route(
         5 * board.W + 20
     };
 
-    for _ in 0..max_len {
+    let mut first_goal_depth = None;
+    for depth in 0..max_len {
         if beam.is_empty() || Instant::now() >= deadline {
             break;
         }
@@ -862,13 +891,79 @@ fn find_route(
         next_beam.truncate(beam_width);
         beam = next_beam;
         if !special && !goals.is_empty() {
+            let first = *first_goal_depth.get_or_insert(depth);
+            if !allow_short_detours || depth >= first + NORMAL_ROUTE_DETOUR_STEPS {
+                break;
+            }
+        }
+    }
+    goals.sort_unstable_by_key(|&(value, _)| Reverse(value));
+    let mut ranked_routes: Vec<(i64, Route)> = Vec::with_capacity(goals.len());
+    for (value, id) in goals {
+        let route = reconstruct(&arena, id);
+        if ranked_routes
+            .iter()
+            .any(|(_, old)| old.tiles == route.tiles)
+        {
+            continue;
+        }
+        ranked_routes.push((value, route));
+    }
+    let mut routes: Vec<Route> = Vec::with_capacity(candidate_limit);
+    if allow_short_detours {
+        if let Some(min_length) = ranked_routes.iter().map(|(_, route)| route.length).min() {
+            for length in min_length..=min_length + NORMAL_ROUTE_DETOUR_STEPS {
+                if let Some((_, route)) = ranked_routes
+                    .iter()
+                    .find(|(_, route)| route.length == length)
+                {
+                    routes.push(route.clone());
+                    if routes.len() >= candidate_limit {
+                        return routes;
+                    }
+                }
+            }
+        }
+    }
+    for (_, route) in ranked_routes {
+        if routes.iter().any(|old| old.tiles == route.tiles) {
+            continue;
+        }
+        routes.push(route);
+        if routes.len() >= candidate_limit {
             break;
         }
     }
-    goals
-        .into_iter()
-        .max_by_key(|x| x.0)
-        .map(|(_, id)| reconstruct(&arena, id))
+    routes
+}
+
+fn find_route(
+    board: &Board,
+    base: &[u8],
+    fixed: &[u8],
+    source: usize,
+    target: usize,
+    width: usize,
+    special: bool,
+    damage: Option<&DamageModel>,
+    depth_limit: Option<usize>,
+    deadline: Instant,
+) -> Option<Route> {
+    find_routes(
+        board,
+        base,
+        fixed,
+        source,
+        target,
+        width,
+        special,
+        damage,
+        depth_limit,
+        deadline,
+        1,
+    )
+    .into_iter()
+    .next()
 }
 
 fn apply_route(orientation: &mut [u8], domains: &mut [u8], route: &Route, keep_domain: bool) {
@@ -881,6 +976,73 @@ fn apply_route(orientation: &mut [u8], domains: &mut [u8], route: &Route, keep_d
             domains[cell] = 1 << o;
         }
     }
+}
+
+fn intersect_route_domains(domains: &mut [u8], route: &Route) -> bool {
+    if route
+        .tiles
+        .iter()
+        .any(|&(cell, _, required_domain)| domains[cell] & required_domain == 0)
+    {
+        return false;
+    }
+    for &(cell, _, required_domain) in &route.tiles {
+        domains[cell] &= required_domain;
+    }
+    true
+}
+
+fn deferred_route_selections(
+    fixed: &[u8],
+    choices: &[DeferredRouteChoice],
+    limit: usize,
+) -> Vec<Vec<usize>> {
+    fn dfs(
+        choice_id: usize,
+        choices: &[DeferredRouteChoice],
+        domains: Vec<u8>,
+        current: &mut Vec<usize>,
+        results: &mut Vec<Vec<usize>>,
+        limit: usize,
+    ) {
+        if results.len() >= limit {
+            return;
+        }
+        if choice_id == choices.len() {
+            results.push(current.clone());
+            return;
+        }
+        for (route_id, route) in choices[choice_id].routes.iter().enumerate() {
+            let mut next_domains = domains.clone();
+            if !intersect_route_domains(&mut next_domains, route) {
+                continue;
+            }
+            current.push(route_id);
+            dfs(
+                choice_id + 1,
+                choices,
+                next_domains,
+                current,
+                results,
+                limit,
+            );
+            current.pop();
+            if results.len() >= limit {
+                break;
+            }
+        }
+    }
+
+    let mut results = Vec::new();
+    dfs(
+        0,
+        choices,
+        fixed.to_vec(),
+        &mut Vec::new(),
+        &mut results,
+        limit,
+    );
+    results
 }
 
 fn resolve_domains(board: &Board, orientation: &mut [u8], domains: &[u8], deadline: Instant) {
@@ -1135,49 +1297,311 @@ fn build_layered_with_specials(
         0
     };
     let mut layer_counts = [0usize; OUTER_LAYERS];
+    let mut selected_detours = 0usize;
     let mut order: Vec<usize> = (0..board.pairs.len())
         .filter(|id| !reserved.contains(id))
         .collect();
     order.sort_unstable_by_key(|&id| ordinary_pair_priority(board, board.pairs[id]));
+    if ENABLE_LAYERED_BOARD_BEAM {
+        #[derive(Clone)]
+        struct LayeredBeamState {
+            orientation: Vec<u8>,
+            fixed: Vec<u8>,
+            connected: Vec<bool>,
+            layer_counts: [usize; OUTER_LAYERS],
+            connected_count: usize,
+            optimistic_count: usize,
+            route_length: usize,
+            detour_count: usize,
+            rotation_lower_bound: i32,
+            deferred: Vec<DeferredRouteChoice>,
+        }
+        let rotation_lower_bound = |domains: &[u8]| -> i32 {
+            board
+                .valid_cells
+                .iter()
+                .map(|&cell| board.domain_rotation[cell][domains[cell] as usize])
+                .sum()
+        };
+        let reachable = optimistic_reachable_pairs(board, &fixed);
+        let initial_rotation_lower_bound = rotation_lower_bound(&fixed);
+        let mut beam = vec![LayeredBeamState {
+            orientation,
+            fixed,
+            connected_count: connected.iter().filter(|&&x| x).count(),
+            optimistic_count: reachable.iter().filter(|&&x| x).count(),
+            connected,
+            layer_counts,
+            route_length: 0,
+            detour_count: 0,
+            rotation_lower_bound: initial_rotation_lower_bound,
+            deferred: Vec::new(),
+        }];
 
-    for layer in 0..OUTER_LAYERS {
-        for &id in &order {
-            if connected[id] || Instant::now() >= outer_deadline {
-                continue;
+        'layers: for layer in 0..OUTER_LAYERS {
+            for &id in &order {
+                if Instant::now() >= outer_deadline {
+                    break 'layers;
+                }
+                let pair = board.pairs[id];
+                let mut next_beam = Vec::with_capacity(
+                    beam.len() * (LAYERED_ROUTE_CANDIDATES + 1),
+                );
+                for state in beam.into_iter() {
+                    next_beam.push(state.clone());
+                    if state.connected[id] || Instant::now() >= outer_deadline {
+                        continue;
+                    }
+                    let routes = find_routes(
+                        board,
+                        &state.orientation,
+                        &state.fixed,
+                        pair[0],
+                        pair[1],
+                        layer + 1,
+                        false,
+                        None,
+                        Some(layer),
+                        outer_deadline,
+                        LAYERED_ROUTE_CANDIDATES,
+                    );
+                    if routes.is_empty() {
+                        continue;
+                    }
+                    let shortest_length = routes.iter().map(|route| route.length).min().unwrap();
+                    let has_detour = routes.iter().any(|route| route.length > shortest_length);
+                    if ENABLE_DEFERRED_ROUTE_CHOICES
+                        && has_detour
+                        && state.deferred.len() < LAYERED_DEFERRED_CHOICES
+                    {
+                        let mut candidate = state.clone();
+                        candidate.connected[id] = true;
+                        candidate.route_length += shortest_length;
+                        candidate.deferred.push(DeferredRouteChoice {
+                            layer,
+                            shortest_length,
+                            routes: routes.clone(),
+                        });
+                        if !deferred_route_selections(
+                            &candidate.fixed,
+                            &candidate.deferred,
+                            1,
+                        )
+                        .is_empty()
+                        {
+                            next_beam.push(candidate);
+                        }
+                    }
+                    let before = optimistic_reachable_pairs(board, &state.fixed);
+                    for route in routes
+                        .into_iter()
+                        .filter(|route| !has_detour || route.length == shortest_length)
+                    {
+                        let mut candidate = state.clone();
+                        apply_route(
+                            &mut candidate.orientation,
+                            &mut candidate.fixed,
+                            &route,
+                            keep_domains,
+                        );
+                        let after = optimistic_reachable_pairs(board, &candidate.fixed);
+                        let keeps_future_open = (0..board.pairs.len()).all(|other| {
+                            state.connected[other]
+                                || other == id
+                                || !before[other]
+                                || after[other]
+                        });
+                        if !keeps_future_open {
+                            continue;
+                        }
+                        if deferred_route_selections(
+                            &candidate.fixed,
+                            &candidate.deferred,
+                            1,
+                        )
+                        .is_empty()
+                        {
+                            continue;
+                        }
+                        candidate.connected[id] = true;
+                        candidate.connected_count += 1;
+                        candidate.optimistic_count = after.iter().filter(|&&x| x).count();
+                        candidate.layer_counts[layer] += 1;
+                        candidate.route_length += route.length;
+                        candidate.detour_count += usize::from(route.length > shortest_length);
+                        candidate.rotation_lower_bound = rotation_lower_bound(&candidate.fixed);
+                        next_beam.push(candidate);
+                    }
+                }
+                let beam_rank = |state: &LayeredBeamState| {
+                    Reverse(
+                        state.connected_count as i64 * 1_000_000_000
+                            + state.optimistic_count as i64 * 1_000_000
+                            - state.route_length as i64 * 1_000
+                            - state.rotation_lower_bound as i64,
+                    )
+                };
+                next_beam.sort_unstable_by_key(beam_rank);
+                let mut regular_states = Vec::new();
+                let mut deferred_states = Vec::new();
+                for state in next_beam {
+                    if state.deferred.is_empty() {
+                        regular_states.push(state);
+                    } else {
+                        deferred_states.push(state);
+                    }
+                }
+                let regular_reserved = (LAYERED_BOARD_BEAM_WIDTH
+                    - LAYERED_DEFERRED_RESERVED_STATES)
+                    .min(regular_states.len());
+                let deferred_reserved =
+                    LAYERED_DEFERRED_RESERVED_STATES.min(deferred_states.len());
+                let mut selected = Vec::with_capacity(LAYERED_BOARD_BEAM_WIDTH);
+                selected.extend(regular_states.drain(..regular_reserved));
+                selected.extend(deferred_states.drain(..deferred_reserved));
+                regular_states.append(&mut deferred_states);
+                regular_states.sort_unstable_by_key(beam_rank);
+                selected.extend(
+                    regular_states
+                        .into_iter()
+                        .take(LAYERED_BOARD_BEAM_WIDTH.saturating_sub(selected.len())),
+                );
+                selected.sort_unstable_by_key(beam_rank);
+                beam = selected;
             }
-            let pair = board.pairs[id];
-            let Some(route) = find_route(
-                board,
-                &orientation,
-                &fixed,
-                pair[0],
-                pair[1],
-                layer + 1,
-                false,
-                None,
-                Some(layer),
-                outer_deadline,
-            ) else {
-                continue;
+        }
+        if !ENABLE_DEFERRED_ROUTE_CHOICES {
+            let chosen = beam.into_iter().next().expect("empty layered board beam");
+            orientation = chosen.orientation;
+            fixed = chosen.fixed;
+            layer_counts = chosen.layer_counts;
+            selected_detours = chosen.detour_count;
+        } else {
+        let mut best_materialized: Option<(
+            Stats,
+            Vec<u8>,
+            Vec<u8>,
+            [usize; OUTER_LAYERS],
+            usize,
+            usize,
+        )> = None;
+        for state in beam {
+            let selections = if state.deferred.is_empty() {
+                vec![Vec::new()]
+            } else {
+                deferred_route_selections(
+                    &state.fixed,
+                    &state.deferred,
+                    LAYERED_DEFERRED_ASSIGNMENTS,
+                )
             };
+            for selection in selections {
+                let mut trial_orientation = state.orientation.clone();
+                let mut trial_fixed = state.fixed.clone();
+                let mut trial_layers = state.layer_counts;
+                let mut touched = vec![false; trial_fixed.len()];
+                let mut detours = state.detour_count;
+                for (choice, &route_id) in state.deferred.iter().zip(&selection) {
+                    let route = &choice.routes[route_id];
+                    debug_assert!(intersect_route_domains(&mut trial_fixed, route));
+                    detours += usize::from(route.length > choice.shortest_length);
+                    trial_layers[choice.layer] += 1;
+                    for &(cell, _, _) in &route.tiles {
+                        touched[cell] = true;
+                    }
+                }
+                for &cell in &board.valid_cells {
+                    let domain = trial_fixed[cell];
+                    if domain >> trial_orientation[cell] & 1 == 0 {
+                        let mut best_orientation = 0u8;
+                        let mut best_cost = i32::MAX;
+                        for candidate_orientation in 0..6u8 {
+                            if domain >> candidate_orientation & 1 == 0 {
+                                continue;
+                            }
+                            let cost = rotation_cost(
+                                board.initial[cell],
+                                candidate_orientation,
+                            );
+                            if cost < best_cost {
+                                best_cost = cost;
+                                best_orientation = candidate_orientation;
+                            }
+                        }
+                        trial_orientation[cell] = best_orientation;
+                    }
+                    if touched[cell] && !keep_domains {
+                        trial_fixed[cell] = 1 << trial_orientation[cell];
+                    }
+                }
+                let stats = board.evaluate(&trial_orientation);
+                if best_materialized
+                    .as_ref()
+                    .is_none_or(|entry| stats.quality() > entry.0.quality())
+                {
+                    best_materialized = Some((
+                        stats,
+                        trial_orientation,
+                        trial_fixed,
+                        trial_layers,
+                        detours,
+                        state.deferred.len(),
+                    ));
+                }
+            }
+        }
+        let (stats, chosen_orientation, chosen_fixed, chosen_layers, detours, deferred_count) =
+            best_materialized.expect("empty layered materialization");
+        eprintln!(
+            "layered_materialized deferred={} detours={} k={} score={}",
+            deferred_count, detours, stats.matched, stats.score,
+        );
+        orientation = chosen_orientation;
+        fixed = chosen_fixed;
+        layer_counts = chosen_layers;
+        selected_detours = detours;
+        }
+    } else {
+        for layer in 0..OUTER_LAYERS {
+            for &id in &order {
+                if connected[id] || Instant::now() >= outer_deadline {
+                    continue;
+                }
+                let pair = board.pairs[id];
+                let Some(route) = find_route(
+                    board,
+                    &orientation,
+                    &fixed,
+                    pair[0],
+                    pair[1],
+                    layer + 1,
+                    false,
+                    None,
+                    Some(layer),
+                    outer_deadline,
+                ) else {
+                    continue;
+                };
 
-            let before = optimistic_reachable_pairs(board, &fixed);
-            let mut trial_orientation = orientation.clone();
-            let mut trial_fixed = fixed.clone();
-            apply_route(
-                &mut trial_orientation,
-                &mut trial_fixed,
-                &route,
-                keep_domains,
-            );
-            let after = optimistic_reachable_pairs(board, &trial_fixed);
-            let keeps_future_open = (0..board.pairs.len())
-                .all(|other| connected[other] || other == id || !before[other] || after[other]);
-            if keeps_future_open {
-                orientation = trial_orientation;
-                fixed = trial_fixed;
-                connected[id] = true;
-                layer_counts[layer] += 1;
+                let before = optimistic_reachable_pairs(board, &fixed);
+                let mut trial_orientation = orientation.clone();
+                let mut trial_fixed = fixed.clone();
+                apply_route(
+                    &mut trial_orientation,
+                    &mut trial_fixed,
+                    &route,
+                    keep_domains,
+                );
+                let after = optimistic_reachable_pairs(board, &trial_fixed);
+                let keeps_future_open = (0..board.pairs.len()).all(|other| {
+                    connected[other] || other == id || !before[other] || after[other]
+                });
+                if keeps_future_open {
+                    orientation = trial_orientation;
+                    fixed = trial_fixed;
+                    connected[id] = true;
+                    layer_counts[layer] += 1;
+                }
             }
         }
     }
@@ -1221,8 +1645,8 @@ fn build_layered_with_specials(
         );
     }
     eprintln!(
-        "layered_outer_priority direct_fixed={} reserved={:?}",
-        direct_fixed, reserved
+        "layered_outer_priority direct_fixed={} reserved={:?} detours={}",
+        direct_fixed, reserved, selected_detours
     );
     (orientation, layer_counts, special_done, special_value)
 }
@@ -2214,6 +2638,199 @@ fn compact_paths_sa(board: &Board, orientation: &mut Vec<u8>, start: Instant, de
         initial_metrics.compressible_length, output_metrics.compressible_length,
         initial_metrics.unmatched_length, output_metrics.unmatched_length,
         initial_metrics.moves, output_metrics.moves);
+}
+
+fn multi_trunk_lns(board: &Board, orientation: &mut Vec<u8>, start: Instant, deadline: Instant) {
+    if start >= deadline {
+        return;
+    }
+    let mut scratch = EvalScratch::new(board.valid.len());
+    let initial = board.evaluate_with_scratch(orientation, &mut scratch);
+    let differential = DifferentialEval::new(board, orientation, &mut scratch);
+    let mut matched = Vec::new();
+    for id in 0..board.pairs.len() {
+        let value = differential.contribution[id];
+        if value <= 0 {
+            continue;
+        }
+        let (_, length) = board.trace_pair(orientation, id, &mut scratch, None);
+        let bonuses = if length > 0 { value / length - 1 } else { -1 };
+        matched.push((bonuses, value, length, id));
+    }
+    matched.sort_unstable_by_key(|&(bonuses, value, length, id)| {
+        (Reverse(bonuses), Reverse(value), Reverse(length), id)
+    });
+    let heroes: Vec<usize> = matched
+        .iter()
+        .take(MULTI_TRUNK_LNS_HEROES)
+        .map(|&(_, _, _, id)| id)
+        .collect();
+    if heroes.len() < 2 {
+        eprintln!(
+            "multi_trunk_lns heroes={} victims=0 hero_done=0 restored=0 k={}->{} score_delta=0 accepted=false elapsed_ms={}",
+            heroes.len(), initial.matched, initial.matched, start.elapsed().as_millis()
+        );
+        return;
+    }
+
+    let mut hero_cells = vec![false; board.valid.len()];
+    for &id in &heroes {
+        for &cell in &differential.pair_cells[id] {
+            hero_cells[cell] = true;
+        }
+    }
+    let mut near_hero = hero_cells.clone();
+    for &cell in &board.valid_cells {
+        if !hero_cells[cell] {
+            continue;
+        }
+        for side in 0..6 {
+            if let Some((next, _)) = board.next(cell, side) {
+                near_hero[next] = true;
+            }
+        }
+    }
+    let mut victim_candidates = Vec::new();
+    for &(bonuses, value, length, id) in &matched {
+        if heroes.contains(&id) {
+            continue;
+        }
+        let mut overlap = 0usize;
+        let mut proximity = 0usize;
+        for &cell in &differential.pair_cells[id] {
+            overlap += usize::from(hero_cells[cell]);
+            proximity += usize::from(near_hero[cell]);
+        }
+        victim_candidates.push((overlap, proximity, bonuses, value, length, id));
+    }
+    victim_candidates.sort_unstable_by_key(
+        |&(overlap, proximity, bonuses, value, length, id)| {
+            (
+                Reverse(overlap),
+                Reverse(proximity),
+                bonuses,
+                value,
+                length,
+                id,
+            )
+        },
+    );
+    let mut victims: Vec<usize> = victim_candidates
+        .iter()
+        .take(MULTI_TRUNK_LNS_VICTIMS)
+        .map(|&(_, _, _, _, _, id)| id)
+        .collect();
+    victims.sort_unstable_by_key(|&id| pair_distance(board, board.pairs[id]));
+
+    let mut work = orientation.clone();
+    let mut domains = vec![0u8; board.valid.len()];
+    for &cell in &board.valid_cells {
+        domains[cell] = ALL_ORIENTATIONS;
+    }
+    let selected = heroes
+        .iter()
+        .chain(victims.iter())
+        .fold(0u128, |mask, &id| mask | (1u128 << id));
+    // Preserve every non-ruined matched path as local (enter,out) constraints.
+    // Their unused strands remain free, so the hero group can still share tiles.
+    for id in 0..board.pairs.len() {
+        if differential.contribution[id] <= 0 || selected >> id & 1 != 0 {
+            continue;
+        }
+        let (mut cell, mut enter) = board.exits[board.pairs[id][0]];
+        for _ in 0..=3 * board.valid_count {
+            let out = paired_dir(work[cell], enter);
+            let mut required = 0u8;
+            for o in 0..6u8 {
+                if paired_dir(o, enter) == out {
+                    required |= 1 << o;
+                }
+            }
+            domains[cell] &= required;
+            debug_assert!(domains[cell] != 0 && domains[cell] >> work[cell] & 1 != 0);
+            let Some((next, next_enter)) = board.next(cell, out) else {
+                break;
+            };
+            cell = next;
+            enter = next_enter;
+        }
+    }
+
+    let total_span = deadline.saturating_duration_since(start);
+    let hero_phase_deadline =
+        (start + total_span * MULTI_TRUNK_LNS_HERO_PERCENT / 100).min(deadline);
+    let mut hero_done = 0usize;
+    for (index, &id) in heroes.iter().enumerate() {
+        let now = Instant::now();
+        if now >= hero_phase_deadline {
+            break;
+        }
+        let left = heroes.len() - index;
+        let route_deadline = now + hero_phase_deadline.duration_since(now) / left as u32;
+        let pair = board.pairs[id];
+        let damage = board.damage_model(&work);
+        if let Some(route) = find_route(
+            board,
+            &work,
+            &domains,
+            pair[0],
+            pair[1],
+            OUTER_LAYERS,
+            true,
+            Some(&damage),
+            None,
+            route_deadline,
+        ) {
+            apply_route(&mut work, &mut domains, &route, true);
+            hero_done += 1;
+        }
+    }
+
+    let mut restored = 0usize;
+    for (index, &id) in victims.iter().enumerate() {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let left = victims.len() - index;
+        let route_deadline = now + deadline.duration_since(now) / left as u32;
+        let pair = board.pairs[id];
+        if let Some(route) = find_route(
+            board,
+            &work,
+            &domains,
+            pair[0],
+            pair[1],
+            OUTER_LAYERS,
+            false,
+            None,
+            None,
+            route_deadline,
+        ) {
+            apply_route(&mut work, &mut domains, &route, true);
+            restored += 1;
+        }
+    }
+    if Instant::now() < deadline {
+        resolve_domains(board, &mut work, &domains, deadline);
+    }
+    let candidate = board.evaluate_with_scratch(&work, &mut scratch);
+    let accepted = candidate.score > initial.score && board.tester_safe(&work);
+    if accepted {
+        orientation.clone_from(&work);
+    }
+    eprintln!(
+        "multi_trunk_lns heroes={} victims={} hero_done={} restored={} k={}->{} score_delta={} accepted={} elapsed_ms={}",
+        heroes.len(),
+        victims.len(),
+        hero_done,
+        restored,
+        initial.matched,
+        candidate.matched,
+        candidate.score - initial.score,
+        accepted,
+        start.elapsed().as_millis()
+    );
 }
 
 fn build_multitile_choices(board: &Board, orientation: &[u8]) -> Vec<MultiTileChoice> {
@@ -3652,12 +4269,65 @@ fn main() {
         );
         let compact_start = Instant::now();
         let compact_deadline = (compact_start + Duration::from_millis(400)).min(deadline);
-        compact_paths_sa(
-            &board,
-            &mut best_orientation,
-            compact_start,
-            compact_deadline,
+        let before_reallocation = board.evaluate(&best_orientation);
+        let use_compact = !ENABLE_MULTI_TRUNK_LNS
+            || (board.valid_count <= 80
+                && 5 * board.M as i64 * before_reallocation.moves as i64
+                    > before_reallocation.total);
+        eprintln!(
+            "reallocation_branch kind={} cells={} penalty_ratio={:.4}",
+            if use_compact { "compact" } else { "multi_trunk_lns" },
+            board.valid_count,
+            board.M as f64 * before_reallocation.moves as f64
+                / before_reallocation.total.max(1) as f64
         );
+        if use_compact {
+            compact_paths_sa(
+                &board,
+                &mut best_orientation,
+                compact_start,
+                compact_deadline,
+            );
+        } else {
+            let reallocation_base = best_orientation.clone();
+            let mut lns_candidate = reallocation_base.clone();
+            let lns_deadline = (compact_start
+                + Duration::from_millis(MULTI_TRUNK_LNS_LIMIT_MS))
+            .min(compact_deadline);
+            multi_trunk_lns(
+                &board,
+                &mut lns_candidate,
+                compact_start,
+                lns_deadline,
+            );
+            let fallback_start = Instant::now();
+            let mut compact_candidate = reallocation_base;
+            if fallback_start < compact_deadline {
+                compact_paths_sa(
+                    &board,
+                    &mut compact_candidate,
+                    fallback_start,
+                    compact_deadline,
+                );
+            }
+            let lns_stats = board.evaluate(&lns_candidate);
+            let compact_stats = board.evaluate(&compact_candidate);
+            let choose_lns = lns_stats.quality() > compact_stats.quality()
+                && board.tester_safe(&lns_candidate);
+            best_orientation = if choose_lns {
+                lns_candidate
+            } else {
+                compact_candidate
+            };
+            eprintln!(
+                "reallocation_select kind={} lns_k={} lns_score={} compact_k={} compact_score={}",
+                if choose_lns { "multi_trunk_lns" } else { "compact" },
+                lns_stats.matched,
+                lns_stats.score,
+                compact_stats.matched,
+                compact_stats.score
+            );
+        }
         search_rotations(
             &board,
             &mut best_orientation,
