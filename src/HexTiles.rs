@@ -1762,6 +1762,7 @@ fn run_tree_board_beam(
         );
         let stats = board.evaluate_with_scratch(&state.orientation, &mut eval_scratch);
         let mut used_segments = 0usize;
+        let mut shortest_sum = 0usize;
         for id in 0..board.pairs.len() {
             let (value, length) =
                 board.trace_pair(&state.orientation, id, &mut eval_scratch, None);
@@ -1769,6 +1770,7 @@ fn run_tree_board_beam(
                 continue;
             }
             used_segments += length as usize;
+            shortest_sum += pair_distance(board, board.pairs[id]) + 1;
         }
         let free_segments = (3 * board.valid_count).saturating_sub(used_segments);
         let projected_extra = if used_segments == 0 {
@@ -1800,6 +1802,7 @@ fn run_tree_board_beam(
             average_multiplier_milli,
             projected_moves,
             projected_total,
+            shortest_sum,
         ));
     }
     let mut chosen_index = 0usize;
@@ -1817,6 +1820,7 @@ fn run_tree_board_beam(
         average_multiplier_milli,
         projected_moves,
         projected_total,
+        shortest_sum,
     ) = scored[chosen_index].clone();
     tree_board_move_to(
         board,
@@ -1826,10 +1830,12 @@ fn run_tree_board_beam(
         chosen.node,
     );
     eprintln!(
-        "tree_board_beam nodes={} expanded={} reachability={} tracked_k={} exact_k={} exact_score={} projected_score={} projected_t={} projected_m={} used={} free={} avg_multiplier_milli={} segments={} rotated={} rotation_lb={} elapsed_ms={}",
+        "tree_board_beam nodes={} expanded={} reachability={} tracked_k={} exact_k={} exact_score={} projected_score={} projected_t={} projected_m={} used={} shortest={} detour={} free={} bonuses={} avg_multiplier_milli={} segments={} rotated={} rotation_lb={} elapsed_ms={}",
         nodes.len(), expanded, reachability_calls, chosen.connected_count,
         chosen_stats.matched, chosen_stats.score, projected_score, projected_total,
-        projected_moves, used_segments, free_segments, average_multiplier_milli,
+        projected_moves, used_segments, shortest_sum,
+        used_segments.saturating_sub(shortest_sum), free_segments,
+        board.bonus.iter().filter(|&&value| value).count(), average_multiplier_milli,
         chosen.route_length, state.rotated_tile_count, state.rotation_lower_bound,
         started.elapsed().as_millis(),
     );
@@ -3651,6 +3657,7 @@ fn resolve_multitile_choices(
 fn search_rotations(
     board: &Board,
     orientation: &mut Vec<u8>,
+    target_fallback: &[u8],
     target_matched: usize,
     start: Instant,
     deadline: Instant,
@@ -3664,12 +3671,42 @@ fn search_rotations(
     let end_temperature = SA_END_TEMP;
     let use_differential = board.W >= 15;
     let mut differential = DifferentialEval::new(board, &current, &mut eval_scratch);
+    // A target is an upper cap only when construction is already within the
+    // beam's retained top-k window.  A low-k construction is merely incomplete
+    // and must remain free to add connections during rotation search.
+    let lock_target = target_matched + TREE_BOARD_K_LEVELS - 1 >= board.pairs.len();
+    // A connection consumes at least its short route and competes with bonus
+    // trunks for the remaining segments.  Use one full-board, all-bonus pass as
+    // the marginal resource price of moving away from the construction target.
+    let bonus_count = board.bonus.iter().filter(|&&value| value).count() as i64;
+    let target_step = (3 * board.valid_count) as i64 * (bonus_count + 1);
     let energy = |s: Stats| {
         let q = s.total - board.M as i64 * s.moves as i64;
-        s.score as f64 + 3.0 * s.matched as f64 + 0.15 * q as f64
+        let target_gap = if lock_target {
+            s.matched.abs_diff(target_matched) as i64
+        } else {
+            target_matched.saturating_sub(s.matched) as i64
+        };
+        (s.score - target_step * target_gap) as f64 + 0.15 * q as f64
     };
-    let mut best = current.clone();
-    let mut best_stats = current_stats;
+    let mut best = if lock_target {
+        target_fallback.to_vec()
+    } else {
+        current.clone()
+    };
+    let mut best_stats = if lock_target {
+        board.evaluate_with_scratch(&best, &mut eval_scratch)
+    } else {
+        current_stats
+    };
+    debug_assert!(!lock_target || best_stats.matched == target_matched);
+    let can_save = |matched: usize| {
+        if lock_target {
+            matched == target_matched
+        } else {
+            matched >= target_matched
+        }
+    };
     let span = deadline
         .saturating_duration_since(start)
         .as_secs_f64()
@@ -3722,7 +3759,7 @@ fn search_rotations(
                     current_stats = next;
                     differential = next_differential;
                     extend_accepts += 1;
-                    if next.matched >= target_matched
+                    if can_save(next.matched)
                         && next.quality() > best_stats.quality()
                         && board.tester_safe(&current)
                     {
@@ -3762,7 +3799,7 @@ fn search_rotations(
                     current_stats = next;
                     differential = DifferentialEval::new(board, &current, &mut eval_scratch);
                     repair_accepts += 1;
-                    if next.matched >= target_matched
+                    if can_save(next.matched)
                         && next.quality() > best_stats.quality()
                         && board.tester_safe(&current)
                     {
@@ -3814,7 +3851,7 @@ fn search_rotations(
                         event_meta.2,
                         event_meta.3,
                     ));
-                    if next.matched >= target_matched
+                    if can_save(next.matched)
                         && next.quality() > best_stats.quality()
                         && board.tester_safe(&current)
                     {
@@ -3894,7 +3931,7 @@ fn search_rotations(
                     &mut route_cells,
                 );
             }
-            if next.matched >= target_matched
+            if can_save(next.matched)
                 && next.quality() > best_stats.quality()
                 && board.tester_safe(&current)
             {
@@ -5108,6 +5145,7 @@ fn main() {
         construct_initial(&board, solve_start, construction_deadline, "main");
     let mut best_stats = board.evaluate(&best_orientation);
     let construction_target_matched = best_stats.matched;
+    let construction_target_orientation = best_orientation.clone();
     if !OUTPUT_CONSTRUCTION_ONLY && Instant::now() < deadline {
         polish(
             &board,
@@ -5194,6 +5232,7 @@ fn main() {
         search_rotations(
             &board,
             &mut best_orientation,
+            &construction_target_orientation,
             construction_target_matched,
             Instant::now(),
             deadline,
