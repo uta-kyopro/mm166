@@ -316,7 +316,7 @@ impl Rng {
     }
 }
 
-fn paired_dir(o: u8, enter: usize) -> usize {
+const fn paired_dir(o: u8, enter: usize) -> usize {
     const TABLE: [[usize; 6]; 6] = [
         [1, 0, 4, 5, 2, 3],
         [4, 2, 1, 5, 0, 3],
@@ -328,7 +328,53 @@ fn paired_dir(o: u8, enter: usize) -> usize {
     TABLE[o as usize][enter]
 }
 
-fn rotation_cost(from: u8, to: u8) -> i32 {
+const fn build_domain_predecessor_enters() -> [[u8; 6]; 64] {
+    let mut table = [[0u8; 6]; 64];
+    let mut domain = 0usize;
+    while domain < 64 {
+        let mut orientation = 0u8;
+        while orientation < 6 {
+            if domain >> orientation & 1 != 0 {
+                let mut enter = 0usize;
+                while enter < 6 {
+                    let out = paired_dir(orientation, enter);
+                    table[domain][out] |= 1 << enter;
+                    enter += 1;
+                }
+            }
+            orientation += 1;
+        }
+        domain += 1;
+    }
+    table
+}
+
+const DOMAIN_PREDECESSOR_ENTERS: [[u8; 6]; 64] = build_domain_predecessor_enters();
+
+const fn build_domain_out_orientations() -> [[[u8; 6]; 6]; 64] {
+    let mut table = [[[0u8; 6]; 6]; 64];
+    let mut domain = 0usize;
+    while domain < 64 {
+        let mut enter = 0usize;
+        while enter < 6 {
+            let mut orientation = 0u8;
+            while orientation < 6 {
+                if domain >> orientation & 1 != 0 {
+                    let out = paired_dir(orientation, enter);
+                    table[domain][enter][out] |= 1 << orientation;
+                }
+                orientation += 1;
+            }
+            enter += 1;
+        }
+        domain += 1;
+    }
+    table
+}
+
+const DOMAIN_OUT_ORIENTATIONS: [[[u8; 6]; 6]; 64] = build_domain_out_orientations();
+
+const fn rotation_cost(from: u8, to: u8) -> i32 {
     const TABLE: [[i32; 6]; 6] = [
         [0, 1, 2, 3, 2, 1],
         [1, 0, 1, 2, 3, 2],
@@ -339,6 +385,40 @@ fn rotation_cost(from: u8, to: u8) -> i32 {
     ];
     TABLE[from as usize][to as usize]
 }
+
+const fn build_best_domain_orientations() -> [[[u8; 64]; 6]; 6] {
+    let mut table = [[[255u8; 64]; 6]; 6];
+    let mut initial = 0u8;
+    while initial < 6 {
+        let mut base = 0u8;
+        while base < 6 {
+            let mut domain = 1usize;
+            while domain < 64 {
+                let mut best_orientation = 255u8;
+                let mut best_cost = i32::MAX;
+                let mut orientation = 0u8;
+                while orientation < 6 {
+                    if domain >> orientation & 1 != 0 {
+                        let cost = rotation_cost(initial, orientation)
+                            + if orientation == base { 0 } else { 1 };
+                        if cost < best_cost {
+                            best_cost = cost;
+                            best_orientation = orientation;
+                        }
+                    }
+                    orientation += 1;
+                }
+                table[initial as usize][base as usize][domain] = best_orientation;
+                domain += 1;
+            }
+            base += 1;
+        }
+        initial += 1;
+    }
+    table
+}
+
+const BEST_DOMAIN_ORIENTATION: [[[u8; 64]; 6]; 6] = build_best_domain_orientations();
 
 fn hex_cell_distance(width: usize, a: usize, b: usize) -> usize {
     let dr = a as isize / width as isize - b as isize / width as isize;
@@ -702,17 +782,11 @@ fn bit_set(bits: &mut [u64], cell: usize) {
 }
 
 fn best_orientation_in_domain(board: &Board, base: &[u8], cell: usize, domain: u8) -> (u8, i32) {
-    let mut best = None::<(i32, u8)>;
-    for o in 0..6u8 {
-        if domain >> o & 1 == 0 {
-            continue;
-        }
-        let cost = rotation_cost(board.initial[cell], o) + if o == base[cell] { 0 } else { 1 };
-        if best.map_or(true, |x| (cost, o) < x) {
-            best = Some((cost, o));
-        }
-    }
-    let (cost, orientation) = best.expect("empty orientation domain");
+    let orientation = BEST_DOMAIN_ORIENTATION[board.initial[cell] as usize][base[cell] as usize]
+        [domain as usize];
+    assert!(orientation != 255, "empty orientation domain");
+    let cost = rotation_cost(board.initial[cell], orientation)
+        + if orientation == base[cell] { 0 } else { 1 };
     (orientation, cost)
 }
 
@@ -725,13 +799,7 @@ fn orientation_choices(
     previous_domain: Option<u8>,
 ) -> ([(usize, u8, u8); 6], usize) {
     let available = domains[cell] & previous_domain.unwrap_or(ALL_ORIENTATIONS);
-    let mut masks = [0u8; 6];
-    for o in 0..6u8 {
-        if available >> o & 1 == 0 {
-            continue;
-        }
-        masks[paired_dir(o, enter)] |= 1 << o;
-    }
+    let masks = DOMAIN_OUT_ORIENTATIONS[available as usize][enter];
     let mut choices = [(0usize, 0u8, 0u8); 6];
     let mut len = 0usize;
     for (out, domain) in IntoIterator::into_iter(masks).enumerate() {
@@ -811,12 +879,12 @@ fn reverse_route_distances(
     if depth_limit.is_some_and(|limit| board.boundary_depth[target_cell] > limit) {
         return epoch;
     }
-    for enter in 0..6 {
-        let can_exit = (0..6u8).any(|orientation| {
-            fixed[target_cell] >> orientation & 1 != 0
-                && paired_dir(orientation, enter) == target_side
-        });
-        if can_exit {
+    let mut target_enters =
+        DOMAIN_PREDECESSOR_ENTERS[fixed[target_cell] as usize][target_side];
+    while target_enters != 0 {
+        let enter = target_enters.trailing_zeros() as usize;
+        target_enters &= target_enters - 1;
+        {
             let state = target_cell * 6 + enter;
             scratch.stamp[state] = epoch;
             scratch.distance[state] = 1;
@@ -835,14 +903,11 @@ fn reverse_route_distances(
         if depth_limit.is_some_and(|limit| board.boundary_depth[previous_cell] > limit) {
             continue;
         }
-        for previous_enter in 0..6 {
-            let can_reach = (0..6u8).any(|orientation| {
-                fixed[previous_cell] >> orientation & 1 != 0
-                    && paired_dir(orientation, previous_enter) == previous_out
-            });
-            if !can_reach {
-                continue;
-            }
+        let mut previous_enters =
+            DOMAIN_PREDECESSOR_ENTERS[fixed[previous_cell] as usize][previous_out];
+        while previous_enters != 0 {
+            let previous_enter = previous_enters.trailing_zeros() as usize;
+            previous_enters &= previous_enters - 1;
             let previous_state = previous_cell * 6 + previous_enter;
             if scratch.stamp[previous_state] != epoch {
                 scratch.stamp[previous_state] = epoch;
@@ -871,6 +936,14 @@ fn reconstruct(arena: &[Node], mut id: usize) -> Route {
         length: last.length,
         bonuses: last.bonuses,
     }
+}
+
+fn route_repeats_cell(route: &Route) -> bool {
+    route.tiles.iter().enumerate().any(|(i, &(cell, _, _))| {
+        route.tiles[..i]
+            .iter()
+            .any(|&(previous, _, _)| previous == cell)
+    })
 }
 
 fn assigned_domain(arena: &[Node], mut id: usize, cell: usize) -> Option<u8> {
@@ -918,7 +991,13 @@ fn find_routes_with_reverse_scratch(
     {
         return Vec::new();
     }
-    let words = (board.valid.len() * if port_revisit { 6 } else { 1 } + 63) / 64;
+    let exact_shortest = reverse_epoch.is_some() && !allow_short_detours;
+    let track_seen = !exact_shortest;
+    let words = if track_seen {
+        (board.valid.len() * if port_revisit { 6 } else { 1 } + 63) / 64
+    } else {
+        0
+    };
     let root = Node {
         cell: start_cell,
         enter: start_side,
@@ -966,11 +1045,13 @@ fn find_routes_with_reverse_scratch(
                 continue;
             }
             let enter_key = if port_revisit { cell * 6 + enter } else { cell };
-            if bit_test(&p.seen, enter_key) {
+            if track_seen && bit_test(&p.seen, enter_key) {
                 continue;
             }
             let mut seen_base = p.seen.clone();
-            bit_set(&mut seen_base, enter_key);
+            if track_seen {
+                bit_set(&mut seen_base, enter_key);
+            }
             let previous_domain = port_revisit
                 .then(|| assigned_domain(&arena, id, cell))
                 .flatten();
@@ -983,7 +1064,7 @@ fn find_routes_with_reverse_scratch(
                 } else {
                     seen_base.clone()
                 };
-                if port_revisit {
+                if track_seen && port_revisit {
                     bit_set(&mut seen, cell * 6 + out);
                 }
                 let node = Node {
@@ -1016,8 +1097,19 @@ fn find_routes_with_reverse_scratch(
                         continue;
                     }
                     let next_key = if port_revisit { nc * 6 + ne } else { nc };
-                    if bit_test(&node.seen, next_key) {
+                    if track_seen && bit_test(&node.seen, next_key) {
                         continue;
+                    }
+                    if exact_shortest {
+                        let epoch = reverse_epoch.unwrap();
+                        let current_state = cell * 6 + enter;
+                        let next_state = nc * 6 + ne;
+                        if !reverse_scratch.reached(next_state, epoch)
+                            || reverse_scratch.distance[next_state] + 1
+                                != reverse_scratch.distance[current_state]
+                        {
+                            continue;
+                        }
                     }
                     let mut child = node;
                     child.cell = nc;
@@ -1071,6 +1163,9 @@ fn find_routes_with_reverse_scratch(
     let mut ranked_routes: Vec<(i64, Route)> = Vec::with_capacity(goals.len());
     for (value, id) in goals {
         let route = reconstruct(&arena, id);
+        if exact_shortest && route_repeats_cell(&route) {
+            continue;
+        }
         if ranked_routes
             .iter()
             .any(|(_, old)| old.tiles == route.tiles)
