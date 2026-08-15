@@ -70,6 +70,9 @@ const MULTI_TRUNK_LNS_LIMIT_MS: u64 = 150;
 const ENABLE_MULTI_TRUNK_LNS: bool = true;
 const SA_START_TEMP: f64 = 240.0;
 const SA_END_TEMP: f64 = 0.01;
+const SA_CYCLES: usize = 3;
+const SMALL_TRIANGLE_INTERVAL_MS: u64 = 180;
+const SMALL_TRIANGLE_BUDGET_MS: u64 = 2;
 const POSTPROCESS_LIMIT_MS: u64 = 450;
 const ALL_ORIENTATIONS: u8 = (1 << 6) - 1;
 
@@ -3725,8 +3728,18 @@ fn search_rotations(
     let mut next_extend = start + Duration::from_millis(LOCAL_EXTEND_INTERVAL_MS);
     let mut next_repair = start + Duration::from_secs_f64(0.65 * span);
     let mut next_connect = start + Duration::from_secs_f64(0.55 * span);
+    let triangles = if board.valid_count <= 80 {
+        collect_triangles(board)
+    } else {
+        Vec::new()
+    };
+    let mut next_triangle = start + Duration::from_millis(SMALL_TRIANGLE_INTERVAL_MS);
+    let mut triangle_sweeps = 0usize;
+    let mut triangle_accepts = 0usize;
     let mut now = Instant::now();
     let mut temperature = start_temperature;
+    let temperature_cycles = SA_CYCLES;
+    let mut active_cycle = 0usize;
     let mut undo = Vec::with_capacity(4);
     let mut proposed = Vec::with_capacity(4);
     let mut updates = Vec::with_capacity(board.pairs.len());
@@ -3741,7 +3754,21 @@ fn search_rotations(
                 break;
             }
             let frac = (now.duration_since(start).as_secs_f64() / span).min(1.0);
-            temperature = start_temperature.powf(1.0 - frac) * end_temperature.powf(frac);
+            let scaled = frac * temperature_cycles as f64;
+            let cycle = (scaled.floor() as usize).min(temperature_cycles - 1);
+            if cycle > active_cycle {
+                active_cycle = cycle;
+                if cycle == 1 {
+                    current.clone_from_slice(target_fallback);
+                } else {
+                    current.clone_from(&best);
+                }
+                current_stats = board.evaluate_with_scratch(&current, &mut eval_scratch);
+                differential = DifferentialEval::new(board, &current, &mut eval_scratch);
+            }
+            let cycle_frac = (scaled - cycle as f64).min(1.0);
+            temperature = start_temperature.powf(1.0 - cycle_frac)
+                * end_temperature.powf(cycle_frac);
         }
         if (board.W + 1) / 2 >= 17 && now >= next_extend {
             next_extend += Duration::from_millis(LOCAL_EXTEND_INTERVAL_MS);
@@ -3766,6 +3793,34 @@ fn search_rotations(
                         best_stats = next;
                         best.clone_from(&current);
                     }
+                }
+            }
+            now = Instant::now();
+            iterations += 1;
+            continue;
+        }
+        if !triangles.is_empty() && now >= next_triangle {
+            next_triangle += Duration::from_millis(SMALL_TRIANGLE_INTERVAL_MS);
+            triangle_sweeps += 1;
+            let local_deadline =
+                (now + Duration::from_millis(SMALL_TRIANGLE_BUDGET_MS)).min(deadline);
+            let accepted = reduce_rotations_by_triangles_with(
+                board,
+                &mut current,
+                &triangles,
+                local_deadline,
+                false,
+            );
+            if accepted > 0 {
+                triangle_accepts += accepted;
+                current_stats = board.evaluate_with_scratch(&current, &mut eval_scratch);
+                differential = DifferentialEval::new(board, &current, &mut eval_scratch);
+                if can_save(current_stats.matched)
+                    && current_stats.quality() > best_stats.quality()
+                    && board.tester_safe(&current)
+                {
+                    best_stats = current_stats;
+                    best.clone_from(&current);
                 }
             }
             now = Instant::now();
@@ -3989,10 +4044,12 @@ fn search_rotations(
         i64::MAX
     };
     let final_cycles = board.alternating_cycles(orientation);
-    eprintln!("rotation_search iterations={} temp={}->{} target_k={} extends={}/{} repairs={}/{} connects={}/{} final_cycles={}/{} diff_avg={:.2} bonuses={} full_bonus_paths={} total_bonus_uses={} rotation_budget={}/{} longest3={:?} weighted3={:?} best_score={}",
-        iterations, start_temperature, end_temperature, target_matched,
+    eprintln!("rotation_search iterations={} temp={}->{} reheats={} target_k={} extends={}/{} repairs={}/{} connects={}/{} triangles={}/{} final_cycles={}/{} diff_avg={:.2} bonuses={} full_bonus_paths={} total_bonus_uses={} rotation_budget={}/{} longest3={:?} weighted3={:?} best_score={}",
+        iterations, start_temperature, end_temperature, temperature_cycles - 1,
+        target_matched,
         extend_accepts, extend_attempts, repair_accepts, repair_attempts,
         connect_accepts, connect_attempts,
+        triangle_accepts, triangle_sweeps,
         final_cycles, board.pairs.len(),
         differential_pairs as f64 / iterations.max(1) as f64,
         board.bonus.iter().filter(|&&x| x).count(),
@@ -4388,13 +4445,13 @@ fn collect_triangles(board: &Board) -> Vec<[usize; 3]> {
     triangles
 }
 
-fn reduce_rotations_by_triangles(
+fn reduce_rotations_by_triangles_with(
     board: &Board,
     orientation: &mut Vec<u8>,
+    triangles: &[[usize; 3]],
     deadline: Instant,
+    log: bool,
 ) -> usize {
-    let triangles = collect_triangles(board);
-
     let mut scratch = EvalScratch::new(board.valid.len());
     let mut stats = board.evaluate_with_scratch(orientation, &mut scratch);
     let initial_moves = stats.moves;
@@ -4403,15 +4460,17 @@ fn reduce_rotations_by_triangles(
     let mut accepted = 0usize;
     loop {
         let mut changed = false;
-        for cells in &triangles {
+        for cells in triangles {
             if Instant::now() >= deadline {
-                eprintln!(
-                    "triangle_post accepted={} rotations_saved={} total_delta={} score_delta={}",
-                    accepted,
-                    initial_moves - stats.moves,
-                    stats.total - initial_total,
-                    stats.score - initial_score
-                );
+                if log {
+                    eprintln!(
+                        "triangle_post accepted={} rotations_saved={} total_delta={} score_delta={}",
+                        accepted,
+                        initial_moves - stats.moves,
+                        stats.total - initial_total,
+                        stats.score - initial_score
+                    );
+                }
                 return accepted;
             }
             let current = [
@@ -4465,14 +4524,25 @@ fn reduce_rotations_by_triangles(
             break;
         }
     }
-    eprintln!(
-        "triangle_post accepted={} rotations_saved={} total_delta={} score_delta={}",
-        accepted,
-        initial_moves - stats.moves,
-        stats.total - initial_total,
-        stats.score - initial_score
-    );
+    if log {
+        eprintln!(
+            "triangle_post accepted={} rotations_saved={} total_delta={} score_delta={}",
+            accepted,
+            initial_moves - stats.moves,
+            stats.total - initial_total,
+            stats.score - initial_score
+        );
+    }
     accepted
+}
+
+fn reduce_rotations_by_triangles(
+    board: &Board,
+    orientation: &mut Vec<u8>,
+    deadline: Instant,
+) -> usize {
+    let triangles = collect_triangles(board);
+    reduce_rotations_by_triangles_with(board, orientation, &triangles, deadline, true)
 }
 
 fn collect_rhombi(board: &Board) -> Vec<[usize; 4]> {
