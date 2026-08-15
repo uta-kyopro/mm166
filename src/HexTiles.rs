@@ -43,6 +43,8 @@ const SECOND_CONSTRUCTION_ROUTE_CANDIDATES: usize = 4;
 const SECOND_CONSTRUCTION_UNMATCHED: usize = 3;
 const SECOND_CONSTRUCTION_LONG_PAIRS: usize = 6;
 const SECOND_CONSTRUCTION_MIN_CELLS: usize = 81;
+const SECOND_FRESH_LIMIT_MS: u64 = 650;
+const SECOND_FRESH_DOMAIN_RESOLVE_MS: u64 = 100;
 const CONSTRUCTION_LIMIT_MS: u64 = 4_500;
 const LAYERED_OUTER_LIMIT_MS: u64 = 700;
 const LAYERED_SPECIAL_LIMIT_MS: u64 = 600;
@@ -74,6 +76,12 @@ const SA_CYCLES: usize = 3;
 const SINGLE_CYCLE_MIN_CELLS: usize = 721;
 const SA_TIME_CHECK_MASK: usize = 255;
 const DIFFERENTIAL_MIN_W: usize = 5;
+const EXPECTED_ROUTE_INTERCEPT: f64 = -1.008_913_24;
+const EXPECTED_ROUTE_SLOPE: f64 = 1.762_249_81;
+const FINAL_MOVES_FROM_CONSTRUCTION_INTERCEPT: f64 = -32.420_024_16;
+const FINAL_MOVES_FROM_N_COEFF: f64 = 8.618_405_14;
+const FINAL_MOVES_FROM_CONSTRUCTION_COEFF: f64 = 0.630_610_78;
+const BEAM_MOVE_MATURITY_RATIO: f64 = 2.0 / 3.0;
 const SMALL_TRIANGLE_INTERVAL_MS: u64 = 180;
 const SMALL_TRIANGLE_BUDGET_MS: u64 = 2;
 const POSTPROCESS_LIMIT_MS: u64 = 450;
@@ -1276,10 +1284,241 @@ fn resolve_domains(board: &Board, orientation: &mut [u8], domains: &[u8], deadli
     );
 }
 
+fn materialize_domains_safely(board: &Board, orientation: &mut [u8], domains: &[u8]) -> bool {
+    let routed = orientation.to_vec();
+    for choice_rank in 0..6usize {
+        orientation.clone_from_slice(&routed);
+        for &cell in &board.valid_cells {
+            let domain = domains[cell];
+            if domain.count_ones() <= 1 {
+                continue;
+            }
+            let mut choices: Vec<u8> = (0..6u8).filter(|&o| domain >> o & 1 != 0).collect();
+            choices.sort_unstable_by_key(|&o| (rotation_cost(board.initial[cell], o), o));
+            orientation[cell] = choices[choice_rank % choices.len()];
+        }
+        if board.tester_safe(orientation) {
+            return true;
+        }
+    }
+    orientation.clone_from_slice(&routed);
+    false
+}
+
 fn pair_distance(board: &Board, pair: [usize; 2]) -> usize {
     let a = board.exits[pair[0]].0;
     let b = board.exits[pair[1]].0;
     hex_cell_distance(board.W, a, b)
+}
+
+fn expected_route_length_between_exits(board: &Board, a: usize, b: usize) -> f64 {
+    let shortest =
+        hex_cell_distance(board.W, board.exits[a].0, board.exits[b].0) as f64 + 1.0;
+    shortest.max(EXPECTED_ROUTE_INTERCEPT + EXPECTED_ROUTE_SLOPE * shortest)
+}
+
+struct ConnectionTargetPlan {
+    matched: usize,
+    dropped_ids: Vec<usize>,
+    rewired_pairs: Vec<[usize; 2]>,
+    wrong_pairs: Vec<[usize; 2]>,
+    offset: usize,
+}
+
+fn estimate_connection_target(
+    board: &Board,
+    construction_orientation: &[u8],
+    construction_moves: i32,
+    construction_archive: &[ConstructionArchiveEntry],
+) -> ConnectionTargetPlan {
+    let pair_count = board.pairs.len();
+    let n = (board.W + 1) / 2;
+    let bonus_count = board.bonus.iter().filter(|&&value| value).count();
+    let total_segments = 3.0 * board.valid_count as f64;
+    let estimated_moves = (FINAL_MOVES_FROM_CONSTRUCTION_INTERCEPT
+        + FINAL_MOVES_FROM_N_COEFF * n as f64
+        + FINAL_MOVES_FROM_CONSTRUCTION_COEFF * construction_moves as f64)
+        .max(construction_moves as f64);
+    let pair_lengths: Vec<f64> = board
+        .pairs
+        .iter()
+        .map(|pair| expected_route_length_between_exits(board, pair[0], pair[1]))
+        .collect();
+    let mut trace_scratch = EvalScratch::new(board.valid.len());
+    let mut drop_candidates = Vec::new();
+    for id in 0..pair_count {
+        let (value, length) = board.trace_pair(
+            construction_orientation,
+            id,
+            &mut trace_scratch,
+            None,
+        );
+        let bonuses = if value > 0 && length > 0 {
+            value / length - 1
+        } else {
+            0
+        };
+        if bonuses == 0 {
+            drop_candidates.push((pair_lengths[id], id));
+        }
+    }
+    drop_candidates
+        .sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let all_correct_length: f64 = pair_lengths.iter().sum();
+    let estimate_score =
+        |matched: usize, correct_length: f64, wrong_length: f64, hero_shortest: f64| {
+        // One retained correct pair is the bonus trunk.  Its shortest part is not
+        // an additional reservation: the whole remaining matched component can
+        // belong to that trunk, including the trunk's own shortest connection.
+        let ordinary_length = (correct_length - hero_shortest).max(0.0);
+        let bonus_length = (total_segments - ordinary_length - wrong_length).max(0.0);
+        let total_value = ordinary_length + (bonus_count + 1) as f64 * bonus_length;
+        let candidate_moves = construction_archive
+            .iter()
+            .find(|entry| {
+                entry.stats.matched == matched
+                    && entry.stats.total as f64 >= BEAM_MOVE_MATURITY_RATIO * total_value
+            })
+            .map_or(estimated_moves, |entry| entry.stats.moves as f64);
+        let score = matched as f64 * (total_value - board.M as f64 * candidate_moves);
+        (score.max(0.0), bonus_length, total_value, candidate_moves)
+    };
+    let (base_score, base_bonus_length, base_total, base_moves) =
+        estimate_score(
+            pair_count,
+            all_correct_length,
+            0.0,
+            pair_lengths.iter().copied().fold(0.0, f64::max),
+        );
+    let mut best = (base_score, pair_count, 0usize, 0usize);
+    let mut summaries = Vec::with_capacity(pair_count.saturating_mul(2));
+    summaries.push((
+        pair_count,
+        0usize,
+        0usize,
+        0.0,
+        base_bonus_length,
+        base_total,
+        base_moves,
+        base_score,
+    ));
+    let mut dropped_original_length = 0.0;
+    let mut dropped = vec![false; pair_count];
+    for drop_count in 1..=drop_candidates.len() {
+        dropped_original_length += drop_candidates[drop_count - 1].0;
+        dropped[drop_candidates[drop_count - 1].1] = true;
+        if drop_count < 2 {
+            continue;
+        }
+        let mut endpoints = Vec::with_capacity(2 * drop_count);
+        for &(_, id) in &drop_candidates[..drop_count] {
+            endpoints.extend_from_slice(&board.pairs[id]);
+        }
+        endpoints.sort_unstable();
+        for offset in 0..2 {
+            let mut restored = 0usize;
+            let mut restored_length = 0.0;
+            let mut wrong_length = 0.0;
+            let mut hero_shortest = (0..pair_count)
+                .filter(|&id| !dropped[id])
+                .map(|id| pair_lengths[id])
+                .fold(0.0, f64::max);
+            for step in 0..drop_count {
+                let a = endpoints[(offset + 2 * step) % endpoints.len()];
+                let b = endpoints[(offset + 2 * step + 1) % endpoints.len()];
+                let length = expected_route_length_between_exits(board, a, b);
+                if board.partner[a] == b {
+                    restored += 1;
+                    restored_length += length;
+                    hero_shortest = hero_shortest.max(length);
+                } else {
+                    wrong_length += length;
+                }
+            }
+            let matched = pair_count - drop_count + restored;
+            let correct_length =
+                all_correct_length - dropped_original_length + restored_length;
+            let (score, bonus_length, total_value, estimated_moves) =
+                estimate_score(matched, correct_length, wrong_length, hero_shortest);
+            summaries.push((
+                matched,
+                drop_count,
+                offset,
+                wrong_length,
+                bonus_length,
+                total_value,
+                estimated_moves,
+                score,
+            ));
+            if score > best.0 {
+                best = (score, matched, drop_count, offset);
+            }
+        }
+    }
+    summaries.sort_unstable_by(|a, b| b.7.total_cmp(&a.7));
+    let mut best_by_matched = vec![None::<(f64, f64)>; pair_count + 1];
+    for summary in &summaries {
+        let slot = &mut best_by_matched[summary.0];
+        if slot.is_none_or(|(score, _)| summary.7 > score) {
+            *slot = Some((summary.7, summary.6));
+        }
+    }
+    eprintln!(
+        "connection_target_estimate best_k={} selected_drop={} offset={} score={:.0} moves={:.1} all_correct={:.1} segments={:.0} top={:?}",
+        best.1,
+        best.2,
+        best.3,
+        best.0,
+        summaries[0].6,
+        all_correct_length,
+        total_segments,
+        summaries
+            .iter()
+            .take(8)
+            .map(|x| (x.0, x.1, x.2, x.3.round() as i64, x.4.round() as i64, x.6.round() as i64, x.7.round() as i64))
+            .collect::<Vec<_>>()
+    );
+    if pair_count <= 20 {
+        eprintln!(
+            "connection_target_by_k {:?}",
+            best_by_matched
+                .iter()
+                .enumerate()
+                .rev()
+                .filter_map(|(matched, estimate)| {
+                    estimate.map(|(score, moves)| {
+                        (matched, score.round() as i64, moves.round() as i64)
+                    })
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+    let dropped_ids: Vec<usize> = drop_candidates[..best.2]
+        .iter()
+        .map(|entry| entry.1)
+        .collect();
+    let mut endpoints = Vec::with_capacity(2 * dropped_ids.len());
+    for &id in &dropped_ids {
+        endpoints.extend_from_slice(&board.pairs[id]);
+    }
+    endpoints.sort_unstable();
+    let mut wrong_pairs = Vec::with_capacity(dropped_ids.len());
+    let mut rewired_pairs = Vec::with_capacity(dropped_ids.len());
+    for step in 0..dropped_ids.len() {
+        let a = endpoints[(best.3 + 2 * step) % endpoints.len().max(1)];
+        let b = endpoints[(best.3 + 2 * step + 1) % endpoints.len().max(1)];
+        rewired_pairs.push([a, b]);
+        if board.partner[a] != b {
+            wrong_pairs.push([a, b]);
+        }
+    }
+    ConnectionTargetPlan {
+        matched: best.1,
+        dropped_ids,
+        rewired_pairs,
+        wrong_pairs,
+        offset: best.3,
+    }
 }
 
 fn ordinary_pair_priority(board: &Board, pair: [usize; 2]) -> usize {
@@ -1414,7 +1653,11 @@ fn special_order(board: &Board) -> Vec<usize> {
     ids
 }
 
-fn optimistic_reachable_pairs(board: &Board, fixed: &[u8]) -> Vec<bool> {
+fn optimistic_reachable_connections(
+    board: &Board,
+    fixed: &[u8],
+    connections: &[[usize; 2]],
+) -> Vec<bool> {
     let ports = board.valid.len() * 6;
     let total = ports + board.exits.len();
     let mut parent: Vec<usize> = (0..total).collect();
@@ -1459,11 +1702,14 @@ fn optimistic_reachable_pairs(board: &Board, fixed: &[u8]) -> Vec<bool> {
             }
         }
     }
-    board
-        .pairs
+    connections
         .iter()
         .map(|pair| root(&mut parent, ports + pair[0]) == root(&mut parent, ports + pair[1]))
         .collect()
+}
+
+fn optimistic_reachable_pairs(board: &Board, fixed: &[u8]) -> Vec<bool> {
+    optimistic_reachable_connections(board, fixed, &board.pairs)
 }
 
 #[derive(Clone, Copy)]
@@ -5071,27 +5317,385 @@ fn second_construction_beam(board: &Board, base_orientation: &[u8], deadline: In
     }
 }
 
+#[allow(dead_code)]
+fn targeted_second_construction_beam(
+    board: &Board,
+    base_orientation: &[u8],
+    plan: &ConnectionTargetPlan,
+    deadline: Instant,
+) -> Vec<u8> {
+    let started = Instant::now();
+    if plan.wrong_pairs.is_empty() || Instant::now() >= deadline {
+        eprintln!(
+            "target_second_beam target_k={} drop={} wrong=0 accepted=false elapsed_ms={}",
+            plan.matched,
+            plan.dropped_ids.len(),
+            started.elapsed().as_millis()
+        );
+        return base_orientation.to_vec();
+    }
+    let mut scratch = EvalScratch::new(board.valid.len());
+    let differential = DifferentialEval::new(board, base_orientation, &mut scratch);
+    let initial = board.evaluate_with_scratch(base_orientation, &mut scratch);
+    let selected_mask = plan
+        .dropped_ids
+        .iter()
+        .fold(0u128, |mask, &id| mask | (1u128 << id));
+    let mut protected_domains = vec![0u8; board.valid.len()];
+    for &cell in &board.valid_cells {
+        protected_domains[cell] = ALL_ORIENTATIONS;
+    }
+    for id in 0..board.pairs.len() {
+        if differential.contribution[id] <= 0 || selected_mask >> id & 1 != 0 {
+            continue;
+        }
+        let (mut cell, mut enter) = board.exits[board.pairs[id][0]];
+        for _ in 0..=3 * board.valid_count {
+            let out = paired_dir(base_orientation[cell], enter);
+            let mut required = 0u8;
+            for o in 0..6u8 {
+                if paired_dir(o, enter) == out {
+                    required |= 1 << o;
+                }
+            }
+            protected_domains[cell] &= required;
+            if protected_domains[cell] == 0 {
+                return base_orientation.to_vec();
+            }
+            let Some((next, next_enter)) = board.next(cell, out) else {
+                break;
+            };
+            cell = next;
+            enter = next_enter;
+        }
+    }
+
+    #[derive(Clone)]
+    struct TargetSecondState {
+        orientation: Vec<u8>,
+        domains: Vec<u8>,
+        routed: usize,
+        route_length: usize,
+        stats: Stats,
+    }
+    let mut virtual_pairs = plan.wrong_pairs.clone();
+    virtual_pairs.sort_unstable_by(|a, b| {
+        expected_route_length_between_exits(board, a[0], a[1])
+            .total_cmp(&expected_route_length_between_exits(board, b[0], b[1]))
+    });
+    let mut beam = vec![TargetSecondState {
+        orientation: base_orientation.to_vec(),
+        domains: protected_domains,
+        routed: 0,
+        route_length: 0,
+        stats: initial,
+    }];
+    let mut reverse_scratch = ReverseBfsScratch::new(board.valid.len() * 6);
+    for pair in &virtual_pairs {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let mut next_beam =
+            Vec::with_capacity(beam.len() * (SECOND_CONSTRUCTION_ROUTE_CANDIDATES + 1));
+        for state in beam.into_iter() {
+            next_beam.push(state.clone());
+            if Instant::now() >= deadline {
+                continue;
+            }
+            let routes = find_routes_with_reverse_scratch(
+                board,
+                &state.orientation,
+                &state.domains,
+                pair[0],
+                pair[1],
+                board.W,
+                false,
+                None,
+                None,
+                deadline,
+                SECOND_CONSTRUCTION_ROUTE_CANDIDATES,
+                &mut reverse_scratch,
+            );
+            if routes.is_empty() {
+                continue;
+            }
+            let shortest = routes.iter().map(|route| route.length).min().unwrap();
+            for route in routes.into_iter().filter(|route| route.length == shortest) {
+                let mut candidate = state.clone();
+                apply_route(
+                    &mut candidate.orientation,
+                    &mut candidate.domains,
+                    &route,
+                    true,
+                );
+                candidate.routed += 1;
+                candidate.route_length += route.length;
+                candidate.stats =
+                    board.evaluate_with_scratch(&candidate.orientation, &mut scratch);
+                next_beam.push(candidate);
+            }
+        }
+        next_beam.sort_unstable_by(|a, b| {
+            b.routed
+                .cmp(&a.routed)
+                .then_with(|| {
+                    a.stats
+                        .matched
+                        .abs_diff(plan.matched)
+                        .cmp(&b.stats.matched.abs_diff(plan.matched))
+                })
+                .then_with(|| b.stats.quality().cmp(&a.stats.quality()))
+                .then_with(|| a.route_length.cmp(&b.route_length))
+        });
+        next_beam.truncate(SECOND_CONSTRUCTION_BEAM_WIDTH);
+        beam = next_beam;
+    }
+    let required = virtual_pairs.len();
+    let best = beam
+        .into_iter()
+        .filter(|state| state.routed == required)
+        .min_by_key(|state| {
+            (
+                state.stats.matched.abs_diff(plan.matched),
+                Reverse(state.stats.quality()),
+                state.route_length,
+            )
+        });
+    let Some(best) = best else {
+        eprintln!(
+            "target_second_beam target_k={} drop={} wrong={} offset={} completed=false accepted=false elapsed_ms={}",
+            plan.matched,
+            plan.dropped_ids.len(),
+            required,
+            plan.offset,
+            started.elapsed().as_millis()
+        );
+        return base_orientation.to_vec();
+    };
+    let routed_stats = best.stats;
+    let mut rebuilt = best.orientation;
+    if Instant::now() < deadline {
+        let rebuild_start = Instant::now();
+        multi_trunk_lns(board, &mut rebuilt, rebuild_start, deadline);
+    }
+    let rebuilt_stats = board.evaluate_with_scratch(&rebuilt, &mut scratch);
+    let accepted = rebuilt_stats.score > initial.score && board.tester_safe(&rebuilt);
+    eprintln!(
+        "target_second_beam target_k={} drop={} wrong={} offset={} routed={} length={} k={}->{}->{} t={}->{}->{} m={}->{}->{} score_delta={} accepted={} elapsed_ms={}",
+        plan.matched,
+        plan.dropped_ids.len(),
+        required,
+        plan.offset,
+        best.routed,
+        best.route_length,
+        initial.matched,
+        routed_stats.matched,
+        rebuilt_stats.matched,
+        initial.total,
+        routed_stats.total,
+        rebuilt_stats.total,
+        initial.moves,
+        routed_stats.moves,
+        rebuilt_stats.moves,
+        rebuilt_stats.score - initial.score,
+        accepted,
+        started.elapsed().as_millis()
+    );
+    if board.tester_safe(&rebuilt) {
+        rebuilt
+    } else {
+        base_orientation.to_vec()
+    }
+}
+
+fn fresh_targeted_second_construction_beam(
+    board: &Board,
+    base_orientation: &[u8],
+    plan: &ConnectionTargetPlan,
+    deadline: Instant,
+) -> Option<Vec<u8>> {
+    let started = Instant::now();
+    let initial = board.evaluate(base_orientation);
+    let dropped_mask = plan
+        .dropped_ids
+        .iter()
+        .fold(0u128, |mask, &id| mask | (1u128 << id));
+    let mut connections: Vec<[usize; 2]> = (0..board.pairs.len())
+        .filter(|&id| dropped_mask >> id & 1 == 0)
+        .map(|id| board.pairs[id])
+        .collect();
+    connections.extend_from_slice(&plan.rewired_pairs);
+    connections.sort_unstable_by(|a, b| {
+        expected_route_length_between_exits(board, a[0], a[1])
+            .total_cmp(&expected_route_length_between_exits(board, b[0], b[1]))
+            .then_with(|| a.cmp(b))
+    });
+
+    #[derive(Clone)]
+    struct FreshSecondState {
+        orientation: Vec<u8>,
+        domains: Vec<u8>,
+        routed: usize,
+        route_length: usize,
+        stats: Stats,
+    }
+    let mut domains = vec![0u8; board.valid.len()];
+    for &cell in &board.valid_cells {
+        domains[cell] = ALL_ORIENTATIONS;
+    }
+    let mut scratch = EvalScratch::new(board.valid.len());
+    let initial_board_stats = board.evaluate_with_scratch(&board.initial, &mut scratch);
+    let mut beam = vec![FreshSecondState {
+        orientation: board.initial.clone(),
+        domains,
+        routed: 0,
+        route_length: 0,
+        stats: initial_board_stats,
+    }];
+    let mut reverse_scratch = ReverseBfsScratch::new(board.valid.len() * 6);
+    let mut processed = 0usize;
+    let routing_deadline = deadline
+        .checked_sub(Duration::from_millis(SECOND_FRESH_DOMAIN_RESOLVE_MS))
+        .unwrap_or(deadline);
+    for pair in &connections {
+        if Instant::now() >= routing_deadline {
+            break;
+        }
+        processed += 1;
+        let mut next_beam =
+            Vec::with_capacity(beam.len() * (SECOND_CONSTRUCTION_ROUTE_CANDIDATES + 1));
+        for state in beam.into_iter() {
+            next_beam.push(state.clone());
+            if Instant::now() >= routing_deadline {
+                continue;
+            }
+            let routes = find_routes_with_reverse_scratch(
+                board,
+                &state.orientation,
+                &state.domains,
+                pair[0],
+                pair[1],
+                board.W,
+                false,
+                None,
+                None,
+                routing_deadline,
+                SECOND_CONSTRUCTION_ROUTE_CANDIDATES,
+                &mut reverse_scratch,
+            );
+            if routes.is_empty() {
+                continue;
+            }
+            let shortest = routes.iter().map(|route| route.length).min().unwrap();
+            for route in routes.into_iter().filter(|route| route.length == shortest) {
+                let mut candidate = state.clone();
+                apply_route(
+                    &mut candidate.orientation,
+                    &mut candidate.domains,
+                    &route,
+                    true,
+                );
+                candidate.routed += 1;
+                candidate.route_length += route.length;
+                candidate.stats =
+                    board.evaluate_with_scratch(&candidate.orientation, &mut scratch);
+                next_beam.push(candidate);
+            }
+        }
+        next_beam.sort_unstable_by(|a, b| {
+            b.routed
+                .cmp(&a.routed)
+                .then_with(|| a.route_length.cmp(&b.route_length))
+                .then_with(|| a.stats.moves.cmp(&b.stats.moves))
+                .then_with(|| b.stats.matched.cmp(&a.stats.matched))
+                .then_with(|| b.stats.score.cmp(&a.stats.score))
+        });
+        next_beam.truncate(SECOND_CONSTRUCTION_BEAM_WIDTH);
+        beam = next_beam;
+    }
+    let Some(best) = beam.into_iter().min_by_key(|state| {
+        (
+            Reverse(state.routed),
+            state.stats.matched.abs_diff(plan.matched),
+            state.route_length,
+            state.stats.moves,
+            Reverse(state.stats.score),
+        )
+    }) else {
+        return None;
+    };
+    let routed_stats = best.stats;
+    let mut rebuilt = best.orientation;
+    let domains_safe = processed == connections.len()
+        && materialize_domains_safely(board, &mut rebuilt, &best.domains);
+    let routed_near_incomplete = routed_stats.matched < plan.matched
+        && routed_stats.matched >= plan.matched.saturating_sub(2);
+    if !domains_safe && routed_near_incomplete && Instant::now() < deadline {
+        multi_trunk_lns(board, &mut rebuilt, Instant::now(), deadline);
+    }
+    let rebuilt_stats = board.evaluate_with_scratch(&rebuilt, &mut scratch);
+    let safe = board.tester_safe(&rebuilt);
+    eprintln!(
+        "fresh_target_second target_k={} drop={} rewired={} wrong={} processed={}/{} routed={} length={} k={}->{}->{} t={}->{}->{} m={}->{}->{} score_delta={} safe={} elapsed_ms={}",
+        plan.matched,
+        plan.dropped_ids.len(),
+        plan.rewired_pairs.len(),
+        plan.wrong_pairs.len(),
+        processed,
+        connections.len(),
+        best.routed,
+        best.route_length,
+        initial.matched,
+        routed_stats.matched,
+        rebuilt_stats.matched,
+        initial.total,
+        routed_stats.total,
+        rebuilt_stats.total,
+        initial.moves,
+        routed_stats.moves,
+        rebuilt_stats.moves,
+        rebuilt_stats.score - initial.score,
+        safe,
+        started.elapsed().as_millis()
+    );
+    if safe
+        && processed == connections.len()
+        && rebuilt_stats.matched >= plan.matched.saturating_sub(2)
+    {
+        Some(rebuilt)
+    } else {
+        None
+    }
+}
+
 fn construct_initial(
     board: &Board,
     phase_start: Instant,
     construction_deadline: Instant,
     label: &str,
-) -> (Vec<u8>, Vec<ConstructionArchiveEntry>) {
+) -> (
+    Vec<u8>,
+    Vec<ConstructionArchiveEntry>,
+    ConnectionTargetPlan,
+    Option<Vec<u8>>,
+) {
     let initial_stats = board.evaluate(&board.initial);
+    let first_deadline = construction_deadline;
     let mut best_orientation = board.initial.clone();
     let mut best_stats = initial_stats;
     let mut archive = Vec::new();
+    let mut second_sa_start = None;
     store_construction_archive(&mut archive, initial_stats, &board.initial);
     let specials = special_order(board);
     for count in 1..=LAYERED_MAX_SPECIAL.min(specials.len()) {
-        if Instant::now() >= construction_deadline {
+        if Instant::now() >= first_deadline {
             break;
         }
         let reserved = &specials[..count];
         let outer_deadline = (Instant::now() + Duration::from_millis(LAYERED_OUTER_LIMIT_MS))
-            .min(construction_deadline);
+            .min(first_deadline);
         let special_deadline = (outer_deadline + Duration::from_millis(LAYERED_SPECIAL_LIMIT_MS))
-            .min(construction_deadline);
+            .min(first_deadline);
         let (mut candidate, layers, done, special_t) = build_layered_with_specials(
             board,
             &mut archive,
@@ -5104,7 +5708,7 @@ fn construct_initial(
         polish(
             board,
             &mut candidate,
-            (Instant::now() + Duration::from_millis(80)).min(construction_deadline),
+            (Instant::now() + Duration::from_millis(80)).min(first_deadline),
         );
         let stats = board.evaluate(&candidate);
         store_construction_archive(&mut archive, stats, &candidate);
@@ -5118,11 +5722,11 @@ fn construct_initial(
     }
     if ENABLE_LEGACY_CONSTRUCTION {
         for &width in &WIDTHS {
-            if Instant::now() >= construction_deadline {
+            if Instant::now() >= first_deadline {
                 break;
             }
             let outer_deadline =
-                (Instant::now() + Duration::from_millis(450)).min(construction_deadline);
+                (Instant::now() + Duration::from_millis(450)).min(first_deadline);
             let use_two_exit_direct = DIRECT_TWO_EXIT_IN_LEGACY;
             let (outer, _) = build_outer(board, width, &[], use_two_exit_direct, outer_deadline);
             let outer_stats = board.evaluate(&outer);
@@ -5131,16 +5735,16 @@ fn construct_initial(
                 best_orientation = outer;
             }
             for count in 1..=MAX_SPECIAL {
-                if Instant::now() >= construction_deadline {
+                if Instant::now() >= first_deadline {
                     break;
                 }
                 let chosen = &specials[..count.min(specials.len())];
                 let gate_deadline =
-                    (Instant::now() + Duration::from_millis(180)).min(construction_deadline);
+                    (Instant::now() + Duration::from_millis(180)).min(first_deadline);
                 let (gated_outer, gated_fixed) =
                     build_outer(board, width, chosen, use_two_exit_direct, gate_deadline);
                 let special_deadline =
-                    (Instant::now() + Duration::from_millis(260)).min(construction_deadline);
+                    (Instant::now() + Duration::from_millis(260)).min(first_deadline);
                 let (mut candidate, special_t, done) = build_with_specials(
                     board,
                     &gated_outer,
@@ -5152,7 +5756,7 @@ fn construct_initial(
                 polish(
                     board,
                     &mut candidate,
-                    (Instant::now() + Duration::from_millis(30)).min(construction_deadline),
+                    (Instant::now() + Duration::from_millis(30)).min(first_deadline),
                 );
                 let stats = board.evaluate(&candidate);
                 eprintln!("construct label={} legacy width={} reserved={} done={} special_t={} k={} t={} m={} score={}",
@@ -5165,16 +5769,46 @@ fn construct_initial(
             }
         }
     }
+    let connection_plan =
+        estimate_connection_target(board, &best_orientation, best_stats.moves, &archive);
     if ENABLE_SECOND_CONSTRUCTION_BEAM
         && board.valid_count >= SECOND_CONSTRUCTION_MIN_CELLS
         && Instant::now() < construction_deadline
     {
-        let second = second_construction_beam(board, &best_orientation, construction_deadline);
-        let stats = board.evaluate(&second);
-        store_construction_archive(&mut archive, stats, &second);
-        if stats.score > best_stats.score && board.tester_safe(&second) {
-            best_stats = stats;
-            best_orientation = second;
+        let second = if connection_plan.wrong_pairs.is_empty() {
+            Some(second_construction_beam(
+                board,
+                &best_orientation,
+                construction_deadline,
+            ))
+        } else {
+            let second_deadline = (Instant::now()
+                + Duration::from_millis(SECOND_FRESH_LIMIT_MS))
+            .min(phase_start + Duration::from_millis(5300));
+            fresh_targeted_second_construction_beam(
+                board,
+                &best_orientation,
+                &connection_plan,
+                second_deadline,
+            )
+        };
+        if let Some(second) = second {
+            let stats = board.evaluate(&second);
+            store_construction_archive(&mut archive, stats, &second);
+            let near_incomplete_target = !connection_plan.wrong_pairs.is_empty()
+                && stats.matched < connection_plan.matched
+                && stats.matched >= connection_plan.matched.saturating_sub(2)
+                && board.tester_safe(&second);
+            if near_incomplete_target {
+                second_sa_start = Some(second.clone());
+            }
+            if !near_incomplete_target
+                && stats.score > best_stats.score
+                && board.tester_safe(&second)
+            {
+                best_stats = stats;
+                best_orientation = second;
+            }
         }
     }
     eprintln!(
@@ -5192,10 +5826,22 @@ fn construct_initial(
         archive.len(),
         archive
             .iter()
-            .map(|entry| (entry.stats.matched, entry.stats.score))
+            .map(|entry| {
+                (
+                    entry.stats.matched,
+                    entry.stats.total,
+                    entry.stats.moves,
+                    entry.stats.score,
+                )
+            })
             .collect::<Vec<_>>()
     );
-    (best_orientation, archive)
+    (
+        best_orientation,
+        archive,
+        connection_plan,
+        second_sa_start,
+    )
 }
 
 fn main() {
@@ -5324,11 +5970,34 @@ fn main() {
     let deadline = solve_start + Duration::from_millis(TIME_LIMIT_MS);
     let construction_deadline =
         (solve_start + Duration::from_millis(CONSTRUCTION_LIMIT_MS)).min(deadline);
-    let (mut best_orientation, construction_archive) =
+    let (
+        mut best_orientation,
+        construction_archive,
+        connection_plan,
+        second_sa_start,
+    ) =
         construct_initial(&board, solve_start, construction_deadline, "main");
     let mut best_stats = board.evaluate(&best_orientation);
-    let construction_target_matched = best_stats.matched;
     let construction_target_orientation = best_orientation.clone();
+    let fallback_target_matched = best_stats.matched;
+    let mut construction_target_matched = best_stats.matched;
+    let mut has_second_sa_start = false;
+    if let Some(second) = second_sa_start {
+        has_second_sa_start = second != construction_target_orientation;
+        best_orientation = second;
+        best_stats = board.evaluate(&best_orientation);
+        construction_target_matched = connection_plan.matched;
+        eprintln!(
+            "target_second_start selected=true target_k={} start_k={} start_t={} start_m={} start_score={} fallback_k={} fallback_score={}",
+            construction_target_matched,
+            best_stats.matched,
+            best_stats.total,
+            best_stats.moves,
+            best_stats.score,
+            board.evaluate(&construction_target_orientation).matched,
+            board.evaluate(&construction_target_orientation).score
+        );
+    }
     if !OUTPUT_CONSTRUCTION_ONLY && Instant::now() < deadline {
         polish(
             &board,
@@ -5412,15 +6081,58 @@ fn main() {
                 compact_stats.score
             );
         }
-        search_rotations(
-            &board,
-            &mut best_orientation,
-            &construction_target_orientation,
-            construction_target_matched,
-            &construction_archive,
-            Instant::now(),
-            deadline,
-        );
+        let rotation_start = Instant::now();
+        if has_second_sa_start {
+            let remaining = deadline.saturating_duration_since(rotation_start);
+            let second_deadline = rotation_start + remaining.mul_f64(0.15);
+            search_rotations(
+                &board,
+                &mut best_orientation,
+                &construction_target_orientation,
+                construction_target_matched,
+                &construction_archive,
+                rotation_start,
+                second_deadline,
+            );
+            let second_result = best_orientation.clone();
+            let second_stats = board.evaluate(&second_result);
+            let mut fallback_result = construction_target_orientation.clone();
+            search_rotations(
+                &board,
+                &mut fallback_result,
+                &construction_target_orientation,
+                fallback_target_matched,
+                &construction_archive,
+                Instant::now(),
+                deadline,
+            );
+            let fallback_stats = board.evaluate(&fallback_result);
+            let choose_second = second_stats.score > fallback_stats.score
+                && board.tester_safe(&second_result);
+            best_orientation = if choose_second {
+                second_result
+            } else {
+                fallback_result
+            };
+            eprintln!(
+                "target_second_ab choose={} second_k={} second_score={} fallback_k={} fallback_score={}",
+                if choose_second { "second" } else { "fallback" },
+                second_stats.matched,
+                second_stats.score,
+                fallback_stats.matched,
+                fallback_stats.score
+            );
+        } else {
+            search_rotations(
+                &board,
+                &mut best_orientation,
+                &construction_target_orientation,
+                construction_target_matched,
+                &construction_archive,
+                rotation_start,
+                deadline,
+            );
+        }
         let postprocess_deadline = Instant::now() + Duration::from_millis(POSTPROCESS_LIMIT_MS);
         improve_by_boundary_signatures(&board, &mut best_orientation, postprocess_deadline);
         let choices = build_multitile_choices(&board, &best_orientation);
