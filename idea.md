@@ -452,6 +452,22 @@ Remove the unified-tile auxiliary objective after the diagnostic.  Even after re
 The alternating-cycle count between the current exit matching and target matching was tested as a smoother SA auxiliary.  A differential prototype cached current exit components and their tile visits.  Each 1--3-tile proposal cut the cached paths at changed tiles, joined at most 24 local ports under the proposed orientations, and recomputed the alternating-cycle count from only the changed exit pairing.  Proposals that spliced an exit path with an internal no-exit loop required an affected-component trace fallback; this was rare outside the smallest board.
 
 Despite the smooth definition, the auxiliary did not improve final score.  At 9.2 seconds, lambda 1 scored `mean_log10=5.173106` and lambda 10 scored 5.174081, versus 5.175180 without the auxiliary.  Extending lambda 10 to 12 seconds, enough to restore or exceed ordinary large-board iteration counts, fell further to 5.172105.  The local pairing update itself was especially costly on tiny boards, and on high-k large boards the cycle count was already close to matched count and added little new gradient.  Remove the prototype and retain `alternating_cycles` as a diagnostic only; a future smooth objective should target unmatched-cycle size or repair distance rather than cycle count alone.
+
+## 不採用: 未接続ペア選択の挿入ビーム
+
+未接続にする候補を距離順の先頭 `p` 本に固定せず、候補端点を円周上へ順次挿入する探索を試した。1ペアの追加は離れた2端点を有効化し、その間の隣接ペアリングの偶奇を反転させるため、単純な加算DPにはならない。未確定端点の状態を持つ代わりに、各部分集合について時計回りの2オフセットを再評価する挿入ビームを用いた。
+
+上位 `p+2` 本の全組合せは大ケースで最大約1秒増えた。全候補・幅6は `mean_log10=5.172263/5.171520`、幅1は `5.173663/5.172877` で、距離順prefixの基準 `5.175418/5.175261` を下回った。また、選択した元ペアが誤接続で再び同じ相手につながる退化があり、選択数 `p` と実際の未接続数が一致しない。元ペア復元を禁止して厳密に `p` 本を未接続にすると `5.170873` で、seed 1--10では新しい目標接続数を選べなかった。幅を広げた場合だけseed 6が `k=51` から `k=49` に変わったが、2回目構築の完成候補は真スコア0で棄却された。実際の再構築可能性を安価に予測できる指標がない限り、この探索は外し、距離順prefixを維持する。
+
+上記の不採用理由は、組合せ探索の推定値で目標 `k` 自体まで選び直した実験に対するもの。目標 `k` は従来推定のまま固定し、`p=P-k` 本の未接続役だけを上位 `p+2` 本から選び直す用途では、探索は一度の `C(p+2,p)=C(p+2,2)` 通りで済む。元ペアを復元する円周ペアリングを禁止し、誤接続の期待距離を第一、諦める元経路長を第二に最小化・最大化する。seed 1--10では `k<P` がseed 1だけで、選択集合も従来と同じだったためスコア差は観測されなかったが、固定kのまま2回目構築へ渡す長経路を避ける前処理として保持する。
+
+## 接続数推定の複数ボーナス幹線
+
+接続数 `k` の推定でも、各未接続数 `p` について上位 `p+2` 本から誤接続期待長が最短になる `p` 本を選んでから推定する。さらに、ボーナスタイルの3線分へ最大3本の幹線を通せる構造に合わせ、通常配線として予約しないhero最短長を上位3本の合計にした。恣意的な接続数補正は入れず、推定スコア最大をそのまま採用する。seed 1では1本想定の `k=12` から、2本・3本想定とも狙いどおり `k=13` へ変わった。seed 1--10の2回平均は2本が `5.172704`、3本が `5.173257`、変更前が `5.175340` で、要求モデル間では3本が優位だが変更前に対する最終スコア改善は未確認。
+
+全 `p` で上位 `p+2` の組合せを調べると、大盤面では最大253,572組・366msを消費した。全 `p` は距離順prefixで先に概算し、暫定最良 `p0` の `p0±2` だけ組合せ探索する。最大組合せ数は119、計測時間は全seedで1ms未満となり、seed 1の `k=13` も維持した。seed 1--10の2回平均は全組合せ `5.173257`、局所組合せ `5.172609` と僅かに下がったが、明確な高速化を優先して局所版を採用する。
+
+局所組合せ版でボーナス幹線想定を再比較すると、seed 1--10の2回平均は2本が `5.172617`、3本が `5.172609` で実質同点だった。seed 1はいずれも `k=13`。過大なボーナス容量見積もりを避ける2本想定を採用する。
 ## SA補助指標: matched最大パス長
 
 - 真スコアに、現在接続できている正解ペアの最大実線分長を小さく加点すると、長い幹線を育てる方向を局所回転へ伝えられる。

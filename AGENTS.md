@@ -136,6 +136,13 @@ foreach ($seed in $seedStart..$seedEnd) {
 Remove-Item $visDir -Recurse -Force
 ```
 
+## 明示指示がある場合のみ：フェーズ別盤面PNG
+
+- フェーズ別可視化では、フェーズごとに定数を書き換えてソルバーを再コンパイルしない。
+- 最新ソルバーを1回だけ実行し、construction、polish、reallocation、low-bonus reallocation、rotation SA、final postprocess終了時の解を、識別可能な開始・終了マーカー付きで標準エラーへ出す。通常提出時はこの出力を無効にする。
+- Pythonで標準エラーから各フェーズの解を抽出し、同じ入力に対する再生ソルバーとしてtesterへ渡してPNG化する。これにより全フェーズを同じ探索軌跡から取得し、ビルド時間と時間依存探索の揺れを避ける。
+- 出力先は `png/phase_snapshots/seed_<seed:04>/` とし、ファイル名を `01_construction_<score>.png` から `06_final_postprocess_<score>.png` の順にする。同じseedの旧フェーズ画像は残さない。
+
 ## 標準ワークフロー
 
 1. `src/HexTiles.rs` を変更する。

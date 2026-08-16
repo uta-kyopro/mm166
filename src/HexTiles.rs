@@ -97,6 +97,8 @@ const FINAL_MOVES_FROM_N_COEFF: f64 = 5.926_529;
 const FINAL_MOVES_FROM_CONSTRUCTION_COEFF: f64 = 0.556_145;
 const FINAL_MOVES_FROM_N_CONSTRUCTION_COEFF: f64 = 0.011_909;
 const BEAM_MOVE_MATURITY_RATIO: f64 = 2.0 / 3.0;
+const ESTIMATED_FULL_BONUS_PATHS: usize = 2;
+const CONNECTION_TARGET_COMBINATION_RADIUS: usize = 2;
 const SMALL_TRIANGLE_INTERVAL_MS: u64 = 180;
 const SMALL_TRIANGLE_BUDGET_MS: u64 = 2;
 const POSTPROCESS_LIMIT_MS: u64 = 450;
@@ -1530,6 +1532,8 @@ fn estimate_connection_target(
     construction_moves: i32,
     construction_archive: &[ConstructionArchiveEntry],
 ) -> ConnectionTargetPlan {
+    let estimate_started = Instant::now();
+    let mut tested_drop_combinations = 0usize;
     let pair_count = board.pairs.len();
     let n = (board.W + 1) / 2;
     let bonus_count = board.bonus.iter().filter(|&&value| value).count();
@@ -1567,9 +1571,9 @@ fn estimate_connection_target(
     let all_correct_length: f64 = pair_lengths.iter().sum();
     let estimate_score =
         |matched: usize, correct_length: f64, wrong_length: f64, hero_shortest: f64| {
-        // One retained correct pair is the bonus trunk.  Its shortest part is not
-        // an additional reservation: the whole remaining matched component can
-        // belong to that trunk, including the trunk's own shortest connection.
+        // Retained hero pairs can be bonus trunks.  Their shortest parts are not
+        // additional reservations: the remaining segments can extend those same
+        // components through the bonus cells.
         let ordinary_length = (correct_length - hero_shortest).max(0.0);
         let bonus_length = (total_segments - ordinary_length - wrong_length).max(0.0);
         let total_value = ordinary_length + (bonus_count + 1) as f64 * bonus_length;
@@ -1588,7 +1592,11 @@ fn estimate_connection_target(
             pair_count,
             all_correct_length,
             0.0,
-            pair_lengths.iter().copied().fold(0.0, f64::max),
+            {
+                let mut lengths = pair_lengths.clone();
+                lengths.sort_unstable_by(|a, b| b.total_cmp(a));
+                lengths.iter().take(ESTIMATED_FULL_BONUS_PATHS).sum()
+            },
         );
     let mut best = (base_score, pair_count, 0usize, 0usize);
     let mut summaries = Vec::with_capacity(pair_count.saturating_mul(2));
@@ -1602,42 +1610,141 @@ fn estimate_connection_target(
         base_moves,
         base_score,
     ));
-    let mut dropped_original_length = 0.0;
-    let mut dropped = vec![false; pair_count];
-    for drop_count in 1..=drop_candidates.len() {
-        dropped_original_length += drop_candidates[drop_count - 1].0;
-        dropped[drop_candidates[drop_count - 1].1] = true;
-        if drop_count < 2 {
-            continue;
-        }
+    // First locate the promising drop count with the cheap longest-prefix
+    // estimate.  The p+2 combination search below is needed only near this p.
+    let mut preliminary_best = (base_score, 0usize);
+    for drop_count in 2..=drop_candidates.len() {
+        let ids: Vec<usize> = drop_candidates[..drop_count]
+            .iter()
+            .map(|entry| entry.1)
+            .collect();
+        let dropped_length: f64 = drop_candidates[..drop_count]
+            .iter()
+            .map(|entry| entry.0)
+            .sum();
         let mut endpoints = Vec::with_capacity(2 * drop_count);
-        for &(_, id) in &drop_candidates[..drop_count] {
+        for &id in &ids {
             endpoints.extend_from_slice(&board.pairs[id]);
         }
         endpoints.sort_unstable();
+        let mut shortest_wrong = f64::INFINITY;
         for offset in 0..2 {
-            let mut restored = 0usize;
-            let mut restored_length = 0.0;
+            let mut valid = true;
             let mut wrong_length = 0.0;
-            let mut hero_shortest = (0..pair_count)
-                .filter(|&id| !dropped[id])
-                .map(|id| pair_lengths[id])
-                .fold(0.0, f64::max);
             for step in 0..drop_count {
                 let a = endpoints[(offset + 2 * step) % endpoints.len()];
                 let b = endpoints[(offset + 2 * step + 1) % endpoints.len()];
-                let length = expected_route_length_between_exits(board, a, b);
                 if board.partner[a] == b {
-                    restored += 1;
-                    restored_length += length;
-                    hero_shortest = hero_shortest.max(length);
-                } else {
-                    wrong_length += length;
+                    valid = false;
+                    break;
+                }
+                wrong_length += expected_route_length_between_exits(board, a, b);
+            }
+            if valid {
+                shortest_wrong = shortest_wrong.min(wrong_length);
+            }
+        }
+        if !shortest_wrong.is_finite() {
+            continue;
+        }
+        let mut dropped = vec![false; pair_count];
+        for &id in &ids {
+            dropped[id] = true;
+        }
+        let mut retained_lengths: Vec<f64> = (0..pair_count)
+            .filter(|&id| !dropped[id])
+            .map(|id| pair_lengths[id])
+            .collect();
+        retained_lengths.sort_unstable_by(|a, b| b.total_cmp(a));
+        let hero_shortest: f64 = retained_lengths
+            .iter()
+            .take(ESTIMATED_FULL_BONUS_PATHS)
+            .sum();
+        let (score, _, _, _) = estimate_score(
+            pair_count - drop_count,
+            all_correct_length - dropped_length,
+            shortest_wrong,
+            hero_shortest,
+        );
+        if score > preliminary_best.0 {
+            preliminary_best = (score, drop_count);
+        }
+    }
+    for drop_count in 1..=drop_candidates.len() {
+        if drop_count < 2 {
+            continue;
+        }
+        let exhaustive = drop_count.abs_diff(preliminary_best.1)
+            <= CONNECTION_TARGET_COMBINATION_RADIUS;
+        let pool_len = if exhaustive {
+            (drop_count + 2).min(drop_candidates.len())
+        } else {
+            drop_count
+        };
+        let pool = &drop_candidates[..pool_len];
+        let mut choice: Vec<usize> = (0..drop_count).collect();
+        let mut selected: Option<(f64, f64, usize, Vec<usize>)> = None;
+        loop {
+            tested_drop_combinations += 1;
+            let ids: Vec<usize> = choice.iter().map(|&index| pool[index].1).collect();
+            let dropped_length: f64 = choice.iter().map(|&index| pool[index].0).sum();
+            let mut endpoints = Vec::with_capacity(2 * drop_count);
+            for &id in &ids {
+                endpoints.extend_from_slice(&board.pairs[id]);
+            }
+            endpoints.sort_unstable();
+            for offset in 0..2 {
+                let mut valid = true;
+                let mut wrong_length = 0.0;
+                for step in 0..drop_count {
+                    let a = endpoints[(offset + 2 * step) % endpoints.len()];
+                    let b = endpoints[(offset + 2 * step + 1) % endpoints.len()];
+                    if board.partner[a] == b {
+                        valid = false;
+                        break;
+                    }
+                    wrong_length += expected_route_length_between_exits(board, a, b);
+                }
+                if valid
+                    && selected.as_ref().is_none_or(|current| {
+                        wrong_length < current.0
+                            || (wrong_length == current.0 && dropped_length > current.1)
+                    })
+                {
+                    selected = Some((wrong_length, dropped_length, offset, ids.clone()));
                 }
             }
-            let matched = pair_count - drop_count + restored;
-            let correct_length =
-                all_correct_length - dropped_original_length + restored_length;
+
+            let mut position = drop_count;
+            while position > 0
+                && choice[position - 1] == pool_len - drop_count + position - 1
+            {
+                position -= 1;
+            }
+            if position == 0 {
+                break;
+            }
+            choice[position - 1] += 1;
+            for index in position..drop_count {
+                choice[index] = choice[index - 1] + 1;
+            }
+        }
+        if let Some((wrong_length, dropped_length, offset, ids)) = selected {
+            let mut dropped = vec![false; pair_count];
+            for &id in &ids {
+                dropped[id] = true;
+            }
+            let mut retained_lengths: Vec<f64> = (0..pair_count)
+                .filter(|&id| !dropped[id])
+                .map(|id| pair_lengths[id])
+                .collect();
+            retained_lengths.sort_unstable_by(|a, b| b.total_cmp(a));
+            let hero_shortest: f64 = retained_lengths
+                .iter()
+                .take(ESTIMATED_FULL_BONUS_PATHS)
+                .sum();
+            let matched = pair_count - drop_count;
+            let correct_length = all_correct_length - dropped_length;
             let (score, bonus_length, total_value, estimated_moves) =
                 estimate_score(matched, correct_length, wrong_length, hero_shortest);
             summaries.push((
@@ -1664,7 +1771,7 @@ fn estimate_connection_target(
         }
     }
     eprintln!(
-        "connection_target_estimate best_k={} selected_drop={} offset={} score={:.0} moves={:.1} all_correct={:.1} segments={:.0} top={:?}",
+        "connection_target_estimate best_k={} selected_drop={} offset={} score={:.0} moves={:.1} all_correct={:.1} segments={:.0} combinations={} elapsed_ms={} top={:?}",
         best.1,
         best.2,
         best.3,
@@ -1672,6 +1779,8 @@ fn estimate_connection_target(
         summaries[0].6,
         all_correct_length,
         total_segments,
+        tested_drop_combinations,
+        estimate_started.elapsed().as_millis(),
         summaries
             .iter()
             .take(8)
@@ -1693,10 +1802,75 @@ fn estimate_connection_target(
                 .collect::<Vec<_>>()
         );
     }
-    let dropped_ids: Vec<usize> = drop_candidates[..best.2]
+    // The score estimator above decides only the target matched count.  Once k
+    // is fixed, choose the abandoned originals separately so that the virtual
+    // wrong wiring handed to the second construction beam is as short as
+    // possible.  Restricting the pool to the longest p+2 originals preserves
+    // most of the score-estimator intent while requiring only C(p+2, p)
+    // (= C(p+2, 2)) combinations.
+    let target_drop = pair_count - best.1;
+    let prefix_dropped_ids: Vec<usize> = drop_candidates[..best.2]
         .iter()
         .map(|entry| entry.1)
         .collect();
+    let mut dropped_ids = prefix_dropped_ids.clone();
+    let mut selected_offset = best.3;
+    let mut selected_wrong_length = f64::INFINITY;
+    let mut selected_dropped_length: f64 =
+        dropped_ids.iter().map(|&id| pair_lengths[id]).sum();
+    if target_drop >= 2 && target_drop <= drop_candidates.len() {
+        let pool_len = (target_drop + 2).min(drop_candidates.len());
+        let pool = &drop_candidates[..pool_len];
+        let mut choice: Vec<usize> = (0..target_drop).collect();
+        loop {
+            let mut candidate_ids: Vec<usize> =
+                choice.iter().map(|&index| pool[index].1).collect();
+            let dropped_length: f64 = choice.iter().map(|&index| pool[index].0).sum();
+            let mut endpoints = Vec::with_capacity(2 * target_drop);
+            for &id in &candidate_ids {
+                endpoints.extend_from_slice(&board.pairs[id]);
+            }
+            endpoints.sort_unstable();
+            for offset in 0..2 {
+                let mut valid = true;
+                let mut wrong_length = 0.0;
+                for step in 0..target_drop {
+                    let a = endpoints[(offset + 2 * step) % endpoints.len()];
+                    let b = endpoints[(offset + 2 * step + 1) % endpoints.len()];
+                    if board.partner[a] == b {
+                        valid = false;
+                        break;
+                    }
+                    wrong_length += expected_route_length_between_exits(board, a, b);
+                }
+                if valid
+                    && (wrong_length < selected_wrong_length
+                        || (wrong_length == selected_wrong_length
+                            && dropped_length > selected_dropped_length))
+                {
+                    candidate_ids.sort_unstable();
+                    dropped_ids = candidate_ids.clone();
+                    selected_offset = offset;
+                    selected_wrong_length = wrong_length;
+                    selected_dropped_length = dropped_length;
+                }
+            }
+
+            let mut position = target_drop;
+            while position > 0
+                && choice[position - 1] == pool_len - target_drop + position - 1
+            {
+                position -= 1;
+            }
+            if position == 0 {
+                break;
+            }
+            choice[position - 1] += 1;
+            for index in position..target_drop {
+                choice[index] = choice[index - 1] + 1;
+            }
+        }
+    }
     let mut endpoints = Vec::with_capacity(2 * dropped_ids.len());
     for &id in &dropped_ids {
         endpoints.extend_from_slice(&board.pairs[id]);
@@ -1705,19 +1879,31 @@ fn estimate_connection_target(
     let mut wrong_pairs = Vec::with_capacity(dropped_ids.len());
     let mut rewired_pairs = Vec::with_capacity(dropped_ids.len());
     for step in 0..dropped_ids.len() {
-        let a = endpoints[(best.3 + 2 * step) % endpoints.len().max(1)];
-        let b = endpoints[(best.3 + 2 * step + 1) % endpoints.len().max(1)];
+        let a = endpoints[(selected_offset + 2 * step) % endpoints.len().max(1)];
+        let b = endpoints[(selected_offset + 2 * step + 1) % endpoints.len().max(1)];
         rewired_pairs.push([a, b]);
         if board.partner[a] != b {
             wrong_pairs.push([a, b]);
         }
     }
+    eprintln!(
+        "connection_target_selection target_k={} drop={} pool={} wrong_length={:.1} ids={:?} prefix_ids={:?}",
+        best.1,
+        dropped_ids.len(),
+        (target_drop + 2).min(drop_candidates.len()),
+        wrong_pairs
+            .iter()
+            .map(|pair| expected_route_length_between_exits(board, pair[0], pair[1]))
+            .sum::<f64>(),
+        dropped_ids,
+        prefix_dropped_ids
+    );
     ConnectionTargetPlan {
         matched: best.1,
         dropped_ids,
         rewired_pairs,
         wrong_pairs,
-        offset: best.3,
+        offset: selected_offset,
     }
 }
 
