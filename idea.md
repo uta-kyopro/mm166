@@ -423,6 +423,36 @@ Ordinary construction requests only shortest routes, so their forward beam can f
 
 A reversible apply/undo visited set was also tested on the old general forward route beam.  It reduced route-search time by roughly 25--35%, but changed beam tie behavior enough to produce an unstable 5.166209 diagnostic score and is superseded by the faster reverse-distance DAG on ordinary paths.  It may still be useful later for special-route search if node ordering and candidate equivalence are preserved explicitly.
 
+## Final rotation-SA neighborhood audit (2026-08-16)
+
+The active final-SA neighborhoods were ordinary 1--3/4-tile rotations, large-board local extension, restore repair, and connect repair; triangle and two-path LNS were already disabled. Across the previous 100-case log, local extension accepted 27/2,790 proposals in 15 cases, restore repair accepted 187/2,394 in 80 cases, and connect repair accepted 60/862 in 26 cases. Connect transactions reported +100 matched connections and +487,712 immediate raw score in total, but these intermediate acceptances did not imply that the candidates survived as final best boards.
+
+Ablations on seeds 1--10 gave `5.175164` with all neighborhoods, `5.175626` without local extension, `5.173452` without restore repair, and `5.175958` without connect repair. Removing local extension reduced the newly improved high-bonus seed 43 from 2.145M to about 2.130M, so retain it despite sparse firing. Restore repair is clearly necessary. Connect repair's 80 ms searches, repeated up to eight times, cost more useful ordinary rotations than their accepted intermediate states return: removing it also left weak seeds 53 and 58 unchanged at 5,700 and 4,160. A maximum-one-attempt variant averaged only `5.174898`, so disable connect repair completely and retain ordinary rotation, large-board local extension, and restore repair.
+
+## Protect outer-ring bonus tiles (2026-08-16)
+
+Ordinary construction used reverse BFS restricted to exact shortest paths, so the finite bonus penalty did not actually create a detour around a bonus tile. Two-exit direct fixing bypassed the penalty entirely. Protect every bonus tile at boundary depth zero from ordinary and wrong-pair routes: skip direct fixing there, remove it from ordinary reverse-BFS reachability, and allow it only when it is the route's endpoint or the route is a special/hero trunk. The resulting BFS still returns a shortest route, but in the graph with reserved outer bonus cells removed.
+
+This changed seed 43 from 1,933,016 to 2,145,252 (+11.0%) and created one path covering all ten bonuses instead of zero. Seed 48 changed from 1,108,032 to 1,163,364 (+5.0%), and its second-construction branch beat the fallback for the first observed time. Two seed 1--10 runs averaged `mean_log10=5.175164`, versus `5.175307` immediately before the change; the 0.03% geometric difference is within run variance, so retain the protection for its large structural gains.
+
+## Weakness audit on 100 cases (2026-08-16)
+
+The unified solver scored `mean_log10=5.190008` on seeds 1--100 and had a geometric mean ratio of `0.98369` against the saved per-seed bests. The weakest size group was `N<=6` at `0.9630`; `N=6` was especially unstable at `0.9138`, versus `0.9844`, `0.9870`, and `0.9948` for sizes 7--10, 11--15, and 16+. Repeating weak small cases recovered seed 15 from 91.7% to 100%, seed 51 from 83.4% to 97.7%, and seed 71 from 90.2% to 95.6%, so much of the small-board gap is rotation-SA variance. Seeds 53 and 58 (`N=4`) stayed at 93.1% and 93.5%, showing a separate structural failure to realize the estimated lower matched count.
+
+The largest systematic scheduling loss is the second-construction branch. It was tried in 22 of 100 cases, and the fallback won all 22. Path reallocation currently runs only on the second-construction start before its 5% rotation-SA audit, while the fallback then starts from the raw construction board. Thus 0.5--0.9 seconds of path search can be spent entirely on a branch that is discarded. Seed 48 demonstrates this: estimated `k=85`, second construction materialized only `k=83`, and fallback `k=87` won; the final score remained 93.0% of its saved best. Either reject low-quality second starts before path reallocation, or apply the shared path portfolio to both starts and allocate rotation time only after comparing their completed path-search states.
+
+Large high-bonus cases are the other structural weakness. Seed 43 (`N=17,M=1,B=10,P=99`) consistently stayed near 91.6%: construction and final evaluation had only `k=97`, low-bonus shortening completed no route, and no path used all ten bonuses. Seed 48 (`N=15,B=9`) also stayed near 93.0%. These need joint missing-pair repair and bonus-trunk reconstruction, not more ordinary rotation iterations. Across all 100 cases, low-bonus reallocation found a positive result in only 13 cases but added 86,800 raw score in total; the monotone transition postprocess improved 56 cases by 93,641 total. Retain both despite their sparse firing.
+
+## Unified path-reallocation portfolio (2026-08-16)
+
+Treat polish, compact path SA, multi-trunk LNS, and low-bonus shortening as one post-construction path-reallocation search. They share one input board, fixed sub-budgets, exact quality comparison, and a common global deadline; rotation SA remains separate because it explores topology by very cheap local moves. Small high-rotation boards run compact SA alone, while other boards compare compact SA with multi-trunk LNS and continue from the better complete board before low-bonus shortening. Remove the always-enabled experiment switches rather than carrying inactive control branches. This reduces the top-level solver to construction, path reallocation, rotation SA, and monotone postprocess without deleting useful neighborhoods.
+
+The behavior-preserving refactor scored `mean_log10=5.174106` and `5.176508` on two seed 1--10 runs, averaging `5.175307` versus the immediately preceding `5.175032`. The difference is within stochastic variation and shows no regression from centralizing the scheduler.
+
+## Post-construction time allocation (2026-08-16)
+
+After the rotation-first construction change, tune post-construction phases independently while leaving the second-construction SA share at its already tested 5%. Two-run seed 1--10 averages for post-construction polish at 100/50/0 ms were `5.175032`, `5.174856`, and `5.174042`; retain 100 ms. Path reallocation at 300/400/500 ms gave `5.174720`, `5.175032`, and `5.175201`, but the 500 ms advantage was smaller than run variance and the wider four-run baseline favored 400 ms; retain 400 ms. Low-bonus reallocation at 200/350, 300/500, and 400/650 ms (normal/high-bonus cases) gave `5.173902`, `5.175032`, and `5.174234`; retain 300/500 ms. The remaining time belongs to rotation SA. Construction and postprocess limits were not binding in this experiment.
+
 ## Rotation-first construction beams (2026-08-16)
 
 Both construction beams rank states by completed connections first and the orientation-domain rotation lower bound second. Route length is only a tie breaker. This keeps the two construction passes on the same objective and leaves true score to the later optimization phases.
@@ -523,3 +553,41 @@ Despite the smooth definition, the auxiliary did not improve final score.  At 9.
 - 短縮対象は先に全て最短再配線し、完成した対象だけで残り時間を分配する二段階方式にした。接続不能対象へ延長予算を予約しない。
 - 300ms版ではseed 2の単体改善が概ね+12,402〜+59,670、seed 10が+2,250〜+7,425。500ms版ではseed 8でも+6,789を確認した。通常300ms、ボーナス4個以上500msを採用し、短縮候補が完成しないケースはほぼ0msで終了する。
 - 採用設定のseed 1〜10を2回実行した`mean_log10`は`5.175418`と`5.175261`、平均`5.175340`。再推定直後の基準`5.173693`より約0.38%相当改善した。200/400ms版はseed 2の回収が+20,475まで落ち、`5.171881`だったため圧縮しすぎと判断した。
+
+### 最終SAで分離した閉ループのボーナス経路への再結合
+
+- 1〜3タイル回転でボーナス経路が短くなると、失われた区間が出口を持たない閉ループとして残る場合がある。変更前後の同一pair寄与差が`loop_length * (bonus_count + 1)`と一致する場合、そのループを当該ボーナス経路へ戻せば回収できる寄与を厳密評価前に計算できる。
+- 変更タイルから閉ループだけを追跡し、閉ループと対象経路が同じタイルの別strandを1回ずつ通る箇所で、4端を交差接続するorientationを列挙する。予測した最終`k(t-Mm)`が保存中のベストを超える候補だけ全体評価・安全性確認を行い、実スコアもベストを超えた場合だけ採用する。
+- port訪問配列をstamp付きscratchとして再利用し、寄与差から予測した長さと一致しない閉ループを早期除外する。seed 1〜10では複数ケースで採用され、採用候補の予測スコアと厳密スコアは一致した。最終版の`mean_log10=5.174912`で、直前基準`5.174923`と実質同等の探索性能を維持した。
+- seed 1〜100の同条件A/Bでは、有効版`mean_log10=5.189245`、無効版`5.190631`で、有効版は幾何平均約0.319%悪化した（41勝15分44敗）。サイズ別では`N=3..8`が+0.013%、`N=9..14`が-0.354%、`N=15..20`が-0.565%。大盤面ほど長いループの発火機会は増えるが、現実装では変更セルからの閉路traceを多数回行うコストが通常SAの反復数を奪い、平均効果は逆に悪化する。提出版へ残すなら検査をさらに遅延・限定する必要がある。
+- 短縮元と合流先は同じpairとは限らない。非ボーナス経路の短縮で分離したループ長は寄与減少量そのものであり、これを隣接する別のボーナス経路へ合流すれば`loop_length * target_multiplier`を追加できる。短縮元の倍率でループ長を復元し、合流先は提案盤面上で再traceして実倍率を求める。seed 1〜10では非ボーナス経路由来22回、別pairへの合流132回を採用し、全329採用で予測スコアと厳密スコアが一致した。`mean_log10=5.173820`で、旧マージ版の同じseed集合`5.173878`と実質同等だった。
+
+### N・Bによる最終SA温度のスケーリング
+
+- 保存済みseed 1〜100の最終ベストから、入力`N`,`B`だけで`estimated_score = 5.54 * N^3.66 * (B+1)^1.06`と回帰した。対数RMSEは0.159（典型誤差約1.17倍）、R²は0.995で、温度の桁を決める用途には十分だった。
+- 提案どおり`estimated_score/100 -> /10000`を試すと、大盤面の終了温度が29〜145まで上がって悪化遷移を終盤まで受け、`mean_log10=5.164861`まで低下した。温度を下げた`/1000 -> /1000000`は2回で`5.176059`,`5.175748`、平均`5.175904`となり、固定`240 -> 0.01`の近接基準`5.173820`より幾何平均約0.48%改善した。
+- 終了だけさらに冷やす`/1000 -> /10000000`は`5.175857`、開始を下げる`/3000 -> /1000000`は`5.175313`だった。さらに低い`/10000 -> /1000000`は`5.175675`、`/30000 -> /1000000`は2回で`5.175812`,`5.176494`、平均`5.176153`となった。`/1000`の2回平均をわずかに上回り、固定温度比で幾何平均約0.54%改善したため、開始`/30000`・終了`/1000000`を採用する。係数は先頭定数へまとめ、今後のケース拡張で再調整できるようにする。
+- 最終SA内のMetropolis受理を全て`diff>=0`だけにした完全山登りは`mean_log10=5.174163`で、低温SAの2回平均より幾何平均約0.46%低下した。seed 10は改善した一方、seed 1・8などが悪化したため、開始温度が低くても少数の悪化受理は局所谷を越えるのに必要。完全山登りにはせず低温SAを維持する。
+- Metropolis判定`u < exp(diff/T)`を`diff + T*(-ln u) > 0`へ変形し、`-ln u`の16,384分位点を`f32`定数表としてコンパイル時生成した。乱数の上位14bitを`& 0x3fff`して表を引くため、実行時の`exp`と剰余を除去できる。元の`unit()`も上位bitを使っており、受理分布は量子化以外ほぼ同じである。
+- u16カーソルで表を周期巡回する版は乱数生成も消して最終SA反復数を約4.9%増やしたが、周期列と探索状態の相関により2回平均スコアが約0.35%低下した。乱数index版の上位14bit方式は、2回平均`mean_log10=5.176045`で`exp`版`5.176153`と幾何平均差-0.025%に収まり、最終SA反復数は約4.0%増えたため採用する。表は16,384×4 byteの約64KB。
+- 前計算表版で温度だけを固定した比較では、スコア推定適応温度の2回平均`mean_log10=5.176045`に対し、固定`100->0.1`は`5.175787`（幾何平均-0.059%）、固定`10->0.01`は`5.175454`（-0.136%）だった。差は小さいが固定温度が優位とはいえないため、スコア推定による適応温度を維持する。
+- 開始・終了温度の比を100倍に固定した。現行の前計算Metropolis版では`estimated_score/10000 -> /1000000`がseed 1〜10で`mean_log10=5.175433`、より低い`/30000 -> /3000000`が`5.175191`だった。前者の過去試行も`5.175675`だったため、`/10000 -> /1000000`を比率100の基準として採用する。
+
+### 周辺探索の差分化・キャッシュ高速化
+
+- `connect_repair_candidate`のbeam状態を盤面全cloneから変更セル列へ替え、枝ごとのaffected maskを実際に変更したセルの`cell_masks`だけで累積する。80ms枠のseed 1〜10では接続数を2本増やす採用例があり、通常SA内で有効化した。
+- fresh second constructionは全生成子をclone・全評価せず、親IDとrouteだけをcheap rankで切り詰め、残った幅8だけをmaterializeして正確評価する。主要ケースは120msから104msへ短縮し、構築結果を維持した。
+- `polish`と`resolve_domains`を`DifferentialEval::proposal/commit`へ置換した。domain到達可能性は64 domainの6-port連結成分を定数表化し、隣接辺の二重unionも除いた。tree beam 30回の合計は4620msから最終版約2660msへ約42%短縮した。
+- `compact_metrics`は対象ペアP本と全出口2P本を別々にtraceせず、出口間の実経路成分P本を一度だけ列挙する。反復数合計は661600から約140万へ約2.1倍になった。Reverse BFS scratch再利用、damage modelの二重trace除去も行った。
+- `transition`は最大値が約9400なので`usize`から`u16`へ縮小した。通常rotation SAの総反復数は約4%増えた。高速化統合版のseed 1〜10は2回平均`mean_log10=5.175698`でスコアを維持した。
+- 9.8秒設定はseed 1〜10で`mean_log10=5.175713`、失敗0だったが、tester最大9.977秒と10秒制限への余裕が小さかった。提出探索上限は9.6秒とし、再評価は`mean_log10=5.176230`、失敗0、tester最大9.780秒。約0.2秒の安全余裕を優先して9.6秒を採用する。
+
+### 非ボーナス経路短縮と閉ループ再利用
+
+- 最短距離より長い非ボーナス経路を対象に、他の非ボーナス経路をenter→out制約で固定して対象だけを引き直す近傍をfinal SAへ追加した。短縮後も対象が非ボーナスで、他経路が完全評価後にも接続している場合だけ候補とする。
+- 短縮だけでbest scoreを更新する場合は直接採用し、それ以外は解放された閉ループを隣接ボーナス経路へマージした最終scoreがbestを超える場合だけ採用する。高価値ボーナス幹線1本を固定して安定した合流先にする版では、試験中に長さ5→1、解放長4のループマージ改善を1回確認した。
+- 発火は稀であり、300ms間隔・6ms予算はSA本体を削りすぎた。600ms間隔・4ms予算へ抑えたseed 1〜10は`mean_log10=5.175723`（直前基準`5.176230`）、短縮候補8回、マージ試行5回、採用0回。小幅悪化は試行揺れの範囲だが、常時コストを限定した補完近傍として残す。
+- 全経路の再敷設より、同じ非ボーナス経路上の任意の2点を選び、その間だけを最短化する区間2-opt型がよい。前後区間と他の非ボーナス経路を固定し、両端の入出力ポート間を小幅ビームで短絡する。長さ64以下は全2点対、超える経路は128対を標本化し、幾何下界に対する余剰が最大の区間を試す。seed 1〜10は`mean_log10=5.176773`、区間短縮候補9回、マージ試行5回、採用0回で、全経路版よりSAへの干渉が小さかったため置換採用する。
+- 「非ボーナス経路」には正解pairだけでなく、実際に異なる出口同士を結ぶ誤接続も含める。全出口から到達出口・長さ・ボーナス数を列挙し、正解partner以外へ到達するボーナス0経路を別プール化した。対象以外のボーナス0出口間経路は、正解・誤接続を問わず全て固定する。誤接続にはcontribution減少がないため、短縮差`old_segment-new_segment`を閉ループ長候補としてmerge判定へ明示的に渡す。seed 1〜10の最終版では誤接続プール選択4回、成立0回で、幾何下界との差はあっても他経路維持下の実ポート最短路は短くならなかった。頻度は該当時1/4、予算4msに抑えて残す。
+- compact SAの目的は、非代表の正解経路長を`-200/線分`、誤接続長を`-300/線分`で圧縮することであり、区間短絡近傍と同じである。候補生成器を共有し、compact SAから80msごと・4ms予算で呼ぶよう統合した。短絡はcompact energyで受理し、解放ループを後続の回転でボーナス経路へ合流できて真スコアが改善した場合だけoutputへ保存する。final SA側は同じ生成器を使い、短絡直後の明示的loop mergeを行う役割として残す。
+- compact統合版のseed 1〜10では、2試行で区間候補が7/7回、10/11回energy受理された。`mean_log10`は`5.176466`と`5.175515`で揺れたが、route近傍自体は安定して発火している。compact開始時に誤接続長が残るケースはあったものの、「ボーナス0かつ現経路が最短より長い」誤接続候補は0で、誤接続選択・受理とも0。候補がある場合はcompact側で誤接続を優先し、final側は1/4抽選とする。
