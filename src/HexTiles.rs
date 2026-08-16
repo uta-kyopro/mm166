@@ -42,7 +42,8 @@ const SECOND_CONSTRUCTION_BEAM_WIDTH: usize = 8;
 const SECOND_CONSTRUCTION_ROUTE_CANDIDATES: usize = 4;
 const SECOND_CONSTRUCTION_UNMATCHED: usize = 3;
 const SECOND_CONSTRUCTION_LONG_PAIRS: usize = 6;
-const SECOND_CONSTRUCTION_MIN_CELLS: usize = 81;
+const SECOND_CONSTRUCTION_MIN_CELLS: usize = 0;
+const SECOND_CONSTRUCTION_SA_FRACTION: f64 = 0.05;
 const SECOND_FRESH_LIMIT_MS: u64 = 650;
 const SECOND_FRESH_DOMAIN_RESOLVE_MS: u64 = 100;
 const CONSTRUCTION_LIMIT_MS: u64 = 4_500;
@@ -2329,10 +2330,10 @@ fn run_tree_board_beam(
     let rank = |candidate: &TreeBoardCandidate| {
         Reverse((
             candidate.connected_count,
-            Reverse(candidate.route_length),
-            Reverse(candidate.rotated_tile_count),
-            candidate.optimistic_count,
             Reverse(candidate.rotation_lower_bound),
+            Reverse(candidate.route_length),
+            candidate.optimistic_count,
+            Reverse(candidate.rotated_tile_count),
         ))
     };
     let mut current = 0usize;
@@ -6705,6 +6706,7 @@ fn fresh_targeted_second_construction_beam(
         domains: Vec<u8>,
         routed: usize,
         route_length: usize,
+        rotation_lower_bound: i32,
         stats: Stats,
     }
     let mut domains = vec![0u8; board.valid.len()];
@@ -6718,6 +6720,7 @@ fn fresh_targeted_second_construction_beam(
         domains,
         routed: 0,
         route_length: 0,
+        rotation_lower_bound: 0,
         stats: initial_board_stats,
     }];
     let mut reverse_scratch = ReverseBfsScratch::new(board.valid.len() * 6);
@@ -6757,6 +6760,14 @@ fn fresh_targeted_second_construction_beam(
             let shortest = routes.iter().map(|route| route.length).min().unwrap();
             for route in routes.into_iter().filter(|route| route.length == shortest) {
                 let mut candidate = state.clone();
+                let mut rotation_delta = 0i32;
+                for &(cell, _, required_domain) in &route.tiles {
+                    let old_domain = candidate.domains[cell];
+                    let new_domain = old_domain & required_domain;
+                    debug_assert_ne!(new_domain, 0);
+                    rotation_delta += board.domain_rotation[cell][new_domain as usize]
+                        - board.domain_rotation[cell][old_domain as usize];
+                }
                 apply_route(
                     &mut candidate.orientation,
                     &mut candidate.domains,
@@ -6765,6 +6776,7 @@ fn fresh_targeted_second_construction_beam(
                 );
                 candidate.routed += 1;
                 candidate.route_length += route.length;
+                candidate.rotation_lower_bound += rotation_delta;
                 candidate.stats =
                     board.evaluate_with_scratch(&candidate.orientation, &mut scratch);
                 next_beam.push(candidate);
@@ -6773,8 +6785,8 @@ fn fresh_targeted_second_construction_beam(
         next_beam.sort_unstable_by(|a, b| {
             b.routed
                 .cmp(&a.routed)
+                .then_with(|| a.rotation_lower_bound.cmp(&b.rotation_lower_bound))
                 .then_with(|| a.route_length.cmp(&b.route_length))
-                .then_with(|| a.stats.moves.cmp(&b.stats.moves))
                 .then_with(|| b.stats.matched.cmp(&a.stats.matched))
                 .then_with(|| b.stats.score.cmp(&a.stats.score))
         });
@@ -6785,8 +6797,8 @@ fn fresh_targeted_second_construction_beam(
         (
             Reverse(state.routed),
             state.stats.matched.abs_diff(plan.matched),
+            state.rotation_lower_bound,
             state.route_length,
-            state.stats.moves,
             Reverse(state.stats.score),
         )
     }) else {
@@ -6804,7 +6816,7 @@ fn fresh_targeted_second_construction_beam(
     let rebuilt_stats = board.evaluate_with_scratch(&rebuilt, &mut scratch);
     let safe = board.tester_safe(&rebuilt);
     eprintln!(
-        "fresh_target_second target_k={} drop={} rewired={} wrong={} processed={}/{} routed={} length={} k={}->{}->{} t={}->{}->{} m={}->{}->{} score_delta={} safe={} elapsed_ms={}",
+        "fresh_target_second target_k={} drop={} rewired={} wrong={} processed={}/{} routed={} length={} rotation_lb={} k={}->{}->{} t={}->{}->{} m={}->{}->{} score_delta={} safe={} elapsed_ms={}",
         plan.matched,
         plan.dropped_ids.len(),
         plan.rewired_pairs.len(),
@@ -6813,6 +6825,7 @@ fn fresh_targeted_second_construction_beam(
         connections.len(),
         best.routed,
         best.route_length,
+        best.rotation_lower_bound,
         initial.matched,
         routed_stats.matched,
         rebuilt_stats.matched,
@@ -6963,14 +6976,13 @@ fn construct_initial(
         if let Some(second) = second {
             let stats = board.evaluate(&second);
             store_construction_archive(&mut archive, stats, &second);
-            let near_incomplete_target = !connection_plan.wrong_pairs.is_empty()
-                && stats.matched < connection_plan.matched
+            let usable_target_start = !connection_plan.wrong_pairs.is_empty()
                 && stats.matched >= connection_plan.matched.saturating_sub(2)
                 && board.tester_safe(&second);
-            if near_incomplete_target {
+            if usable_target_start {
                 second_sa_start = Some(second.clone());
             }
-            if !near_incomplete_target
+            if !usable_target_start
                 && stats.score > best_stats.score
                 && board.tester_safe(&second)
             {
@@ -7032,6 +7044,33 @@ fn output_orientation(board: &Board, orientation: &[u8]) {
     for (r, c, d) in moves {
         writeln!(out, "{} {} {}", r, c, d).unwrap();
     }
+}
+
+fn emit_phase_snapshot(board: &Board, phase: &str, orientation: &[u8]) {
+    if std::env::var_os("MM166_PHASE_SNAPSHOTS").is_none() {
+        return;
+    }
+    let mut moves = Vec::new();
+    for cell in 0..orientation.len() {
+        if !board.valid[cell] {
+            continue;
+        }
+        let from = board.initial[cell] as i32;
+        let to = orientation[cell] as i32;
+        let cw = (to - from + 6) % 6;
+        let ccw = (from - to + 6) % 6;
+        let (count, dir) = if cw <= ccw { (cw, 1) } else { (ccw, -1) };
+        for _ in 0..count {
+            moves.push((cell / board.W, cell % board.W, dir));
+        }
+    }
+    let stats = board.evaluate(orientation);
+    eprintln!("@@PHASE_BEGIN {} {}", phase, stats.score);
+    eprintln!("{}", moves.len());
+    for (r, c, d) in moves {
+        eprintln!("{} {} {}", r, c, d);
+    }
+    eprintln!("@@PHASE_END {}", phase);
 }
 
 fn main() {
@@ -7188,12 +7227,14 @@ fn main() {
             board.evaluate(&construction_target_orientation).score
         );
     }
+    emit_phase_snapshot(&board, "01_construction", &best_orientation);
     if !OUTPUT_CONSTRUCTION_ONLY && Instant::now() < deadline {
         polish(
             &board,
             &mut best_orientation,
             (Instant::now() + Duration::from_millis(100)).min(deadline),
         );
+        emit_phase_snapshot(&board, "02_polish", &best_orientation);
         let compact_start = Instant::now();
         let compact_deadline = (compact_start + Duration::from_millis(400)).min(deadline);
         let before_reallocation = board.evaluate(&best_orientation);
@@ -7271,6 +7312,7 @@ fn main() {
                 compact_stats.score
             );
         }
+        emit_phase_snapshot(&board, "03_reallocation", &best_orientation);
         let reallocation_start = Instant::now();
         let reallocation_ms = if board.bonus.iter().filter(|&&x| x).count()
             >= LOW_BONUS_REALLOCATION_HIGH_BONUS_THRESHOLD
@@ -7287,10 +7329,12 @@ fn main() {
             reallocation_start,
             reallocation_deadline,
         );
+        emit_phase_snapshot(&board, "04_low_bonus_reallocation", &best_orientation);
         let rotation_start = Instant::now();
         if has_second_sa_start {
             let remaining = deadline.saturating_duration_since(rotation_start);
-            let second_deadline = rotation_start + remaining.mul_f64(0.15);
+            let second_deadline =
+                rotation_start + remaining.mul_f64(SECOND_CONSTRUCTION_SA_FRACTION);
             search_rotations(
                 &board,
                 &mut best_orientation,
@@ -7339,11 +7383,13 @@ fn main() {
                 deadline,
             );
         }
+        emit_phase_snapshot(&board, "05_rotation_sa", &best_orientation);
         let postprocess_deadline = Instant::now() + Duration::from_millis(POSTPROCESS_LIMIT_MS);
         improve_by_boundary_signatures(&board, &mut best_orientation, postprocess_deadline);
         let choices = build_multitile_choices(&board, &best_orientation);
         resolve_multitile_choices(&board, &mut best_orientation, &choices);
         best_stats = board.evaluate(&best_orientation);
+        emit_phase_snapshot(&board, "06_final_postprocess", &best_orientation);
     }
     eprintln!(
         "final k={} t={} m={} score={} elapsed_ms={}",

@@ -423,6 +423,12 @@ Ordinary construction requests only shortest routes, so their forward beam can f
 
 A reversible apply/undo visited set was also tested on the old general forward route beam.  It reduced route-search time by roughly 25--35%, but changed beam tie behavior enough to produce an unstable 5.166209 diagnostic score and is superseded by the faster reverse-distance DAG on ordinary paths.  It may still be useful later for special-route search if node ordering and candidate equivalence are preserved explicitly.
 
+## Rotation-first construction beams (2026-08-16)
+
+Both construction beams rank states by completed connections first and the orientation-domain rotation lower bound second. Route length is only a tie breaker. This keeps the two construction passes on the same objective and leaves true score to the later optimization phases.
+
+A safe second-pass state within `target_k-2` is forwarded even when its immediate exact score is low. It receives 5% of the remaining rotation-SA time as an alternate start; the original construction receives the other 95%. On seeds 1--10, two runs gave `mean_log10=5.175714` and `5.176259` (average `5.175987`), versus `5.172617` before the rotation-first and second-pass changes. Giving the alternate start 15% instead averaged only `5.171895`, so construction diversity is useful but should not consume much polishing time.
+
 ## Single-pair tile equivalence (2026-08-16)
 
 A tile touched by only one currently matched pair can sometimes change orientation without changing that pair's final endpoint or weighted route value.  This is more general than local entrance-to-exit equivalence: when the same global path uses multiple segments of a tile, a different internal pairing, including a 180-degree rotation, can reconnect the external pieces identically.  Postprocess such cells by trying every strictly cheaper orientation and accepting only when exact matched count and total path value are unchanged and tester safety holds.  On seeds 1--10 this accepted eight tiles and saved thirteen rotation operations: seed 2 saved nine operations across five tiles, including one actual 180-degree change; seed 8 saved two; and seed 10 saved two.  The exact immediate score gains were 1053, 930, and 186 respectively.  This is a monotone rotation reduction and does not depend on the noisy final SA comparison.
