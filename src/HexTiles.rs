@@ -31,6 +31,7 @@ const COMPLETE_TREE_BOARD_BEAM: bool = true;
 const COMPLETE_TREE_BOARD_BEAM_SAFETY_MS: u64 = 60_000;
 const LAYERED_BOARD_BEAM_WIDTH: usize = 10;
 const TREE_BOARD_K_LEVELS: usize = 4;
+const TREE_BOARD_MAX_K_DIVERSE_STATES: usize = 4;
 const PROJECTED_FREE_USE_NUM: i64 = 9;
 const PROJECTED_FREE_USE_DEN: i64 = 10;
 const PROJECTED_ROTATION_NUM: i32 = 11;
@@ -86,7 +87,7 @@ const MULTI_TRUNK_LNS_LIMIT_MS: u64 = 150;
 const ENABLE_TWO_PATH_LNS: bool = false;
 const TWO_PATH_LNS_BUDGET_MS: u64 = 80;
 const TWO_PATH_LNS_PAIR_CANDIDATES: usize = 8;
-const ENABLE_DETACHED_LOOP_MERGE: bool = true;
+const ENABLE_DETACHED_LOOP_MERGE: bool = false;
 const SA_SCORE_ESTIMATE_SCALE: f64 = 5.54;
 const SA_SCORE_ESTIMATE_N_EXP: f64 = 3.66;
 const SA_SCORE_ESTIMATE_B_EXP: f64 = 1.06;
@@ -2669,7 +2670,48 @@ fn run_tree_board_beam(
                 .connected_count;
             let mut selected = Vec::with_capacity(LAYERED_BOARD_BEAM_WIDTH);
             let mut selected_nodes = HashSet::with_capacity(LAYERED_BOARD_BEAM_WIDTH);
-            for delta in 0..TREE_BOARD_K_LEVELS {
+            // Do not let one cheap-looking shortest route monopolize the beam.
+            // At the current maximum k, retain states preferred by different
+            // resource metrics before reserving the usual lower-k fallbacks.
+            for metric in 0..TREE_BOARD_MAX_K_DIVERSE_STATES {
+                let candidate = next_beam
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.connected_count == max_connected
+                            && !selected_nodes.contains(&candidate.node)
+                    })
+                    .min_by_key(|candidate| match metric {
+                        0 => (
+                            candidate.rotation_lower_bound as i64,
+                            candidate.route_length,
+                            usize::MAX - candidate.optimistic_count,
+                            candidate.rotated_tile_count,
+                        ),
+                        1 => (
+                            -(candidate.optimistic_count as i64),
+                            candidate.rotation_lower_bound.max(0) as usize,
+                            candidate.route_length,
+                            candidate.rotated_tile_count,
+                        ),
+                        2 => (
+                            candidate.route_length as i64,
+                            usize::MAX - candidate.optimistic_count,
+                            candidate.rotation_lower_bound.max(0) as usize,
+                            candidate.rotated_tile_count,
+                        ),
+                        _ => (
+                            candidate.rotated_tile_count as i64,
+                            usize::MAX - candidate.optimistic_count,
+                            candidate.rotation_lower_bound.max(0) as usize,
+                            candidate.route_length,
+                        ),
+                    });
+                if let Some(candidate) = candidate {
+                    selected_nodes.insert(candidate.node);
+                    selected.push(candidate.clone());
+                }
+            }
+            for delta in 1..TREE_BOARD_K_LEVELS {
                 let Some(target_connected) = max_connected.checked_sub(delta) else {
                     break;
                 };
@@ -2780,6 +2822,7 @@ fn build_layered_with_specials(
     board: &Board,
     archive: &mut Vec<ConstructionArchiveEntry>,
     reserved: &[usize],
+    order_variant: usize,
     keep_domains: bool,
     use_two_exit_direct: bool,
     outer_deadline: Instant,
@@ -2804,7 +2847,18 @@ fn build_layered_with_specials(
     let mut order: Vec<usize> = (0..board.pairs.len())
         .filter(|id| !reserved.contains(id))
         .collect();
-    order.sort_unstable_by_key(|&id| ordinary_pair_priority(board, board.pairs[id]));
+    order.sort_unstable_by_key(|&id| {
+        let distance = pair_distance(board, board.pairs[id]);
+        let priority = ordinary_pair_priority(board, board.pairs[id]);
+        let tie = match order_variant % 3 {
+            0 => 0,
+            // Among equally ranked pairs, try the more contended diagonal
+            // displacement first in one construction and last in another.
+            1 => distance,
+            _ => usize::MAX - distance,
+        };
+        (priority, tie, id)
+    });
     if ENABLE_LAYERED_BOARD_BEAM && ENABLE_TREE_BOARD_BEAM && !ENABLE_DEFERRED_ROUTE_CHOICES {
         let (next_orientation, next_fixed, next_layer_counts) = run_tree_board_beam(
             board,
@@ -8012,6 +8066,7 @@ fn construct_initial(
             board,
             &mut archive,
             reserved,
+            count - 1,
             count > 1,
             DIRECT_TWO_EXIT_IN_LAYERED,
             outer_deadline,
