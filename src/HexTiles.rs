@@ -54,6 +54,11 @@ const ENABLE_LEGACY_CONSTRUCTION: bool = false;
 const LOCAL_EXTEND_INTERVAL_MS: u64 = 60;
 const LOCAL_EXTEND_BUDGET_MS: u64 = 7;
 const LOCAL_PATTERN_LIMIT_4: usize = 480;
+const LOW_BONUS_REALLOCATION_MS: u64 = 300;
+const LOW_BONUS_REALLOCATION_HIGH_BONUS_MS: u64 = 500;
+const LOW_BONUS_REALLOCATION_HIGH_BONUS_THRESHOLD: usize = 4;
+const LOW_BONUS_REALLOCATION_TARGETS: usize = 8;
+const LOW_BONUS_REALLOCATION_STEP_MS: u64 = 4;
 const RESTORE_REPAIR_INTERVAL_MS: u64 = 120;
 const RESTORE_REPAIR_BUDGET_MS: u64 = 5;
 const CONNECT_REPAIR_INTERVAL_MS: u64 = 450;
@@ -85,11 +90,12 @@ const ENABLE_FINAL_TRIANGLE: bool = false;
 const ENABLE_FINAL_RHOMBUS: bool = false;
 // 0: current Metropolis moves, 1: disable random rotations, 2: allow only delta-k=0.
 const RANDOM_ROTATION_MODE: u8 = 0;
-const EXPECTED_ROUTE_INTERCEPT: f64 = -1.008_913_24;
-const EXPECTED_ROUTE_SLOPE: f64 = 1.762_249_81;
-const FINAL_MOVES_FROM_CONSTRUCTION_INTERCEPT: f64 = -32.420_024_16;
-const FINAL_MOVES_FROM_N_COEFF: f64 = 8.618_405_14;
-const FINAL_MOVES_FROM_CONSTRUCTION_COEFF: f64 = 0.630_610_78;
+const EXPECTED_ROUTE_INTERCEPT: f64 = -0.357_883_3;
+const EXPECTED_ROUTE_SLOPE: f64 = 1.450_421_7;
+const FINAL_MOVES_FROM_CONSTRUCTION_INTERCEPT: f64 = -14.174_81;
+const FINAL_MOVES_FROM_N_COEFF: f64 = 5.926_529;
+const FINAL_MOVES_FROM_CONSTRUCTION_COEFF: f64 = 0.556_145;
+const FINAL_MOVES_FROM_N_CONSTRUCTION_COEFF: f64 = 0.011_909;
 const BEAM_MOVE_MATURITY_RATIO: f64 = 2.0 / 3.0;
 const SMALL_TRIANGLE_INTERVAL_MS: u64 = 180;
 const SMALL_TRIANGLE_BUDGET_MS: u64 = 2;
@@ -1528,10 +1534,6 @@ fn estimate_connection_target(
     let n = (board.W + 1) / 2;
     let bonus_count = board.bonus.iter().filter(|&&value| value).count();
     let total_segments = 3.0 * board.valid_count as f64;
-    let estimated_moves = (FINAL_MOVES_FROM_CONSTRUCTION_INTERCEPT
-        + FINAL_MOVES_FROM_N_COEFF * n as f64
-        + FINAL_MOVES_FROM_CONSTRUCTION_COEFF * construction_moves as f64)
-        .max(construction_moves as f64);
     let pair_lengths: Vec<f64> = board
         .pairs
         .iter()
@@ -1555,6 +1557,11 @@ fn estimate_connection_target(
             drop_candidates.push((pair_lengths[id], id));
         }
     }
+    let estimated_moves = (FINAL_MOVES_FROM_CONSTRUCTION_INTERCEPT
+        + FINAL_MOVES_FROM_N_COEFF * n as f64
+        + FINAL_MOVES_FROM_CONSTRUCTION_COEFF * construction_moves as f64
+        + FINAL_MOVES_FROM_N_CONSTRUCTION_COEFF * n as f64 * construction_moves as f64)
+        .max(0.0);
     drop_candidates
         .sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     let all_correct_length: f64 = pair_lengths.iter().sum();
@@ -2936,15 +2943,16 @@ fn path_states(
     seen: &mut [u32],
     bonus_seen: &mut [u32],
     epoch: u32,
-) -> (usize, usize, usize, Vec<(usize, usize)>) {
+    states: &mut Vec<(usize, usize)>,
+) -> (usize, usize, usize) {
     let (cell, enter) = board.exits[start];
     let mut state = cell * 6 + enter;
     let terminal_base = board.valid.len() * 6;
-    let mut states = Vec::new();
+    states.clear();
     let mut bonuses = 0usize;
     for _ in 0..=3 * board.valid_count {
         if seen[state] == epoch {
-            return (usize::MAX, states.len(), bonuses, states);
+            return (usize::MAX, states.len(), bonuses);
         }
         seen[state] = epoch;
         let cell = state / 6;
@@ -2956,53 +2964,110 @@ fn path_states(
         }
         let next = board.transition[state * 6 + orientation[cell] as usize];
         if next >= terminal_base {
-            return (next - terminal_base, states.len(), bonuses, states);
+            return (next - terminal_base, states.len(), bonuses);
         }
         state = next;
     }
-    (usize::MAX, states.len(), bonuses, states)
+    (usize::MAX, states.len(), bonuses)
+}
+
+struct LocalExtendWorkspace {
+    seen: Vec<u32>,
+    bonus_seen: Vec<u32>,
+    epoch: u32,
+    on_path: Vec<u32>,
+    on_path_epoch: u32,
+    states: Vec<(usize, usize)>,
+    ranked: Vec<(i64, usize, usize)>,
+    trial: Vec<u8>,
+    trace_scratch: EvalScratch,
+    eval_scratch: EvalScratch,
+    updates: Vec<(usize, i64)>,
+}
+
+impl LocalExtendWorkspace {
+    fn new(board: &Board, orientation: &[u8]) -> Self {
+        Self {
+            seen: vec![0; board.valid.len() * 6],
+            bonus_seen: vec![0; board.valid.len()],
+            epoch: 0,
+            on_path: vec![0; board.valid.len()],
+            on_path_epoch: 0,
+            states: Vec::with_capacity(3 * board.valid_count),
+            ranked: Vec::with_capacity(board.pairs.len()),
+            trial: orientation.to_vec(),
+            trace_scratch: EvalScratch::new(board.valid.len()),
+            eval_scratch: EvalScratch::new(board.valid.len()),
+            updates: Vec::with_capacity(board.pairs.len()),
+        }
+    }
+
+    fn next_epoch(&mut self) -> u32 {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.seen.fill(0);
+            self.bonus_seen.fill(0);
+            self.epoch = 1;
+        }
+        self.epoch
+    }
+
+    fn next_path_epoch(&mut self) -> u32 {
+        self.on_path_epoch = self.on_path_epoch.wrapping_add(1);
+        if self.on_path_epoch == 0 {
+            self.on_path.fill(0);
+            self.on_path_epoch = 1;
+        }
+        self.on_path_epoch
+    }
 }
 
 fn local_extend_candidate(
     board: &Board,
     orientation: &[u8],
+    base: Stats,
+    differential: &DifferentialEval,
     rng: &mut Rng,
+    workspace: &mut LocalExtendWorkspace,
     deadline: Instant,
-) -> Option<Vec<u8>> {
-    let mut paths = Vec::new();
-    let mut seen = vec![0u32; board.valid.len() * 6];
-    let mut bonus_seen = vec![0u32; board.valid.len()];
-    let mut epoch = 0u32;
-    for (id, pair) in board.pairs.iter().enumerate() {
-        epoch += 1;
-        let (end, length, bonuses, states) = path_states(
-            board,
-            orientation,
-            pair[0],
-            &mut seen,
-            &mut bonus_seen,
-            epoch,
-        );
-        if end == pair[1] && states.len() >= 2 {
-            paths.push((length * (bonuses + 1), id, length, states));
-        }
-    }
-    if paths.is_empty() {
+) -> Option<(Stats, Vec<u8>)> {
+    workspace.ranked.clear();
+    workspace.ranked.extend(
+        (0..board.pairs.len()).filter_map(|id| {
+            let value = differential.contribution[id];
+            let length = differential.pair_cells[id].len();
+            (value > 0 && length >= 2).then_some((value, id, length))
+        }),
+    );
+    if workspace.ranked.is_empty() {
         return None;
     }
-    paths.sort_unstable_by_key(|x| Reverse(x.0));
-    let pick = rng.usize(paths.len().min(4));
-    let (old_value, id, old_length, states) = &paths[pick];
-    let pair = board.pairs[*id];
-    let mut on_path = vec![false; board.valid.len()];
-    for &(cell, _) in states {
-        on_path[cell] = true;
+    workspace.ranked.sort_unstable_by_key(|x| Reverse(x.0));
+    let pick = rng.usize(workspace.ranked.len().min(4));
+    let (old_value, id, old_length) = workspace.ranked[pick];
+    let pair = board.pairs[id];
+    let epoch = workspace.next_epoch();
+    let (end, traced_length, _) = path_states(
+        board,
+        orientation,
+        pair[0],
+        &mut workspace.seen,
+        &mut workspace.bonus_seen,
+        epoch,
+        &mut workspace.states,
+    );
+    if end != pair[1] || traced_length != old_length {
+        return None;
+    }
+    let path_epoch = workspace.next_path_epoch();
+    for &(cell, _) in &workspace.states {
+        workspace.on_path[cell] = path_epoch;
     }
 
     let mut cluster = None;
-    let offset = rng.usize(states.len());
-    'centers: for step in 0..states.len() {
-        let (center, enter) = states[(offset + step) % states.len()];
+    let offset = rng.usize(workspace.states.len());
+    'centers: for step in 0..workspace.states.len() {
+        let (center, enter) = workspace.states[(offset + step) % workspace.states.len()];
         let current_out = paired_dir(orientation[center], enter);
         let mut neighbors = Vec::new();
         for side in 0..6 {
@@ -3010,7 +3075,7 @@ fn local_extend_candidate(
                 continue;
             }
             if let Some((next, _)) = board.next(center, side) {
-                if !on_path[next] {
+                if workspace.on_path[next] != path_epoch {
                     neighbors.push(next);
                 }
             }
@@ -3029,7 +3094,7 @@ fn local_extend_candidate(
                     for &base in &[a, b] {
                         for side in 0..6 {
                             if let Some((next, _)) = board.next(base, side) {
-                                if !on_path[next] && !cells.contains(&next) {
+                                if workspace.on_path[next] != path_epoch && !cells.contains(&next) {
                                     fourth = Some(next);
                                     break;
                                 }
@@ -3056,59 +3121,74 @@ fn local_extend_candidate(
         total_patterns
     };
     let pattern_offset = rng.usize(total_patterns);
-    let mut candidates: Vec<(i64, usize, i32, Vec<u8>)> = Vec::new();
-    let mut trial = orientation.to_vec();
+    let mut candidates: Vec<(i64, usize, i32, usize)> = Vec::with_capacity(16);
+    workspace.trial.clone_from_slice(orientation);
     let old_rotations: i32 = cells
         .iter()
         .map(|&cell| rotation_cost(board.initial[cell], orientation[cell]))
         .sum();
-    let mut scratch = EvalScratch::new(board.valid.len());
     for step in 0..checks {
         if Instant::now() >= deadline {
             break;
         }
-        let mut code = (pattern_offset + step) % total_patterns;
+        let pattern = (pattern_offset + step) % total_patterns;
+        let mut code = pattern;
         let mut changed = false;
         for &cell in &cells {
             let o = (code % 6) as u8;
             code /= 6;
             changed |= o != orientation[cell];
-            trial[cell] = o;
+            workspace.trial[cell] = o;
         }
         if !changed {
             continue;
         }
-        let (end, length, bonuses) = board.trace_with_scratch(&trial, pair[0], &mut scratch);
-        if end == pair[1] && length > *old_length {
+        let (end, length, bonuses) = board.trace_with_scratch(
+            &workspace.trial,
+            pair[0],
+            &mut workspace.trace_scratch,
+        );
+        if end == pair[1] && length > old_length {
             let rotations: i32 = cells
                 .iter()
-                .map(|&cell| rotation_cost(board.initial[cell], trial[cell]))
+                .map(|&cell| rotation_cost(board.initial[cell], workspace.trial[cell]))
                 .sum();
             let value = length * (bonuses + 1);
             let net_gain = value as i64
-                - *old_value as i64
+                - old_value
                 - board.M as i64 * (rotations - old_rotations) as i64;
-            candidates.push((
-                net_gain,
-                value,
-                rotations,
-                cells.iter().map(|&cell| trial[cell]).collect(),
-            ));
+            candidates.push((net_gain, value, rotations, pattern));
         }
         for &cell in &cells {
-            trial[cell] = orientation[cell];
+            workspace.trial[cell] = orientation[cell];
         }
     }
     candidates.sort_unstable_by_key(|x| (Reverse(x.0), Reverse(x.1), x.2));
     candidates.truncate(8);
+    let affected = cells
+        .iter()
+        .fold(0u128, |mask, &cell| mask | differential.cell_masks[cell]);
     let mut best: Option<(Stats, Vec<u8>)> = None;
-    let mut eval_scratch = EvalScratch::new(board.valid.len());
-    for (_, _, _, values) in candidates {
+    for (_, _, _, mut code) in candidates {
         let mut candidate = orientation.to_vec();
-        for (&cell, &o) in cells.iter().zip(values.iter()) {
-            candidate[cell] = o;
+        for &cell in &cells {
+            candidate[cell] = (code % 6) as u8;
+            code /= 6;
         }
-        let stats = board.evaluate_with_scratch(&candidate, &mut eval_scratch);
+        let moves = base.moves - old_rotations
+            + cells
+                .iter()
+                .map(|&cell| rotation_cost(board.initial[cell], candidate[cell]))
+                .sum::<i32>();
+        let stats = differential.proposal(
+            board,
+            &candidate,
+            base,
+            moves,
+            affected,
+            &mut workspace.eval_scratch,
+            &mut workspace.updates,
+        );
         if best
             .as_ref()
             .map_or(true, |x| stats.quality() > x.0.quality())
@@ -3116,7 +3196,171 @@ fn local_extend_candidate(
             best = Some((stats, candidate));
         }
     }
-    best.map(|x| x.1)
+    best
+}
+
+fn low_bonus_reallocation(
+    board: &Board,
+    orientation: &mut Vec<u8>,
+    start: Instant,
+    deadline: Instant,
+) {
+    let mut scratch = EvalScratch::new(board.valid.len());
+    let initial = board.evaluate_with_scratch(orientation, &mut scratch);
+    let initial_differential = DifferentialEval::new(board, orientation, &mut scratch);
+    let bonus_limit = board.bonus.iter().filter(|&&x| x).count() / 4;
+    let mut targets = Vec::new();
+    for id in 0..board.pairs.len() {
+        let value = initial_differential.contribution[id];
+        let length = initial_differential.pair_cells[id].len();
+        if value <= 0 || length == 0 {
+            continue;
+        }
+        let bonuses = value as usize / length - 1;
+        if bonuses > bonus_limit {
+            continue;
+        }
+        let pair = board.pairs[id];
+        let expected = expected_route_length_between_exits(board, pair[0], pair[1]);
+        let excess = length as f64 - expected;
+        if excess >= 1.5 {
+            targets.push(((excess * 1024.0) as usize, length, bonuses, id));
+        }
+    }
+    targets.sort_unstable_by_key(|x| (Reverse(x.0), Reverse(x.1), x.2, x.3));
+    targets.truncate(LOW_BONUS_REALLOCATION_TARGETS);
+    let jobs = targets.len();
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ initial.score as u64);
+    let mut local_workspace = LocalExtendWorkspace::new(board, orientation);
+    let mut positive = 0usize;
+    let mut extension_attempts = 0usize;
+    let mut extension_accepts = 0usize;
+    let mut best = initial;
+    let mut best_orientation = orientation.clone();
+
+    let route_phase_deadline =
+        (start + Duration::from_millis(10 * jobs as u64)).min(deadline);
+    let mut shortened_jobs = Vec::with_capacity(jobs);
+    for &(_, old_length, bonuses, target_id) in &targets {
+        let now = Instant::now();
+        if now >= route_phase_deadline {
+            break;
+        }
+        let mut work = orientation.clone();
+        let mut domains = vec![0u8; board.valid.len()];
+        for &cell in &board.valid_cells {
+            domains[cell] = ALL_ORIENTATIONS;
+        }
+        for id in 0..board.pairs.len() {
+            if id == target_id || initial_differential.contribution[id] <= 0 {
+                continue;
+            }
+            let (mut cell, mut enter) = board.exits[board.pairs[id][0]];
+            for _ in 0..=3 * board.valid_count {
+                let out = paired_dir(work[cell], enter);
+                let mut required = 0u8;
+                for o in 0..6u8 {
+                    if paired_dir(o, enter) == out {
+                        required |= 1 << o;
+                    }
+                }
+                domains[cell] &= required;
+                let Some((next, next_enter)) = board.next(cell, out) else {
+                    break;
+                };
+                cell = next;
+                enter = next_enter;
+            }
+        }
+        let pair = board.pairs[target_id];
+        let route_deadline = (now + Duration::from_millis(10)).min(route_phase_deadline);
+        let Some(route) = find_route(
+            board,
+            &work,
+            &domains,
+            pair[0],
+            pair[1],
+            OUTER_LAYERS,
+            false,
+            None,
+            None,
+            route_deadline,
+        ) else {
+            continue;
+        };
+        if route.length >= old_length {
+            continue;
+        }
+        let new_length = route.length;
+        apply_route(&mut work, &mut domains, &route, true);
+        shortened_jobs.push((old_length, new_length, bonuses, target_id, work));
+    }
+    let completed = shortened_jobs.len();
+    let completed_jobs = shortened_jobs.len();
+    for (index, (old_length, new_length, bonuses, target_id, mut work)) in
+        shortened_jobs.into_iter().enumerate()
+    {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let jobs_left = completed_jobs - index;
+        let job_deadline = now + deadline.duration_since(now) / jobs_left as u32;
+        let mut work_stats = board.evaluate_with_scratch(&work, &mut scratch);
+        let mut work_differential = DifferentialEval::new(board, &work, &mut scratch);
+        while Instant::now() < job_deadline {
+            extension_attempts += 1;
+            let step_deadline =
+                (Instant::now() + Duration::from_millis(LOW_BONUS_REALLOCATION_STEP_MS))
+                    .min(job_deadline);
+            let Some((stats, candidate)) = local_extend_candidate(
+                board,
+                &work,
+                work_stats,
+                &work_differential,
+                &mut rng,
+                &mut local_workspace,
+                step_deadline,
+            ) else {
+                continue;
+            };
+            if stats.quality() > work_stats.quality() {
+                work = candidate;
+                work_stats = stats;
+                work_differential = DifferentialEval::new(board, &work, &mut scratch);
+                extension_accepts += 1;
+            }
+        }
+        let target_connected = board.trace_pair(&work, target_id, &mut scratch, None).0 > 0;
+        if target_connected && work_stats.matched >= initial.matched && board.tester_safe(&work) {
+            positive += usize::from(work_stats.score > initial.score);
+            if work_stats.quality() > best.quality() {
+                best = work_stats;
+                best_orientation = work;
+                eprintln!(
+                    "low_bonus_reallocation_improve id={} bonus={} length={}->{} score_delta={}",
+                    target_id,
+                    bonuses,
+                    old_length,
+                    new_length,
+                    best.score - initial.score
+                );
+            }
+        }
+    }
+    if best.quality() > initial.quality() {
+        orientation.clone_from(&best_orientation);
+    }
+    eprintln!(
+        "low_bonus_reallocation targets={} completed={} positive={} extensions={}/{} score_delta={} elapsed_ms={}",
+        jobs,
+        completed,
+        positive,
+        extension_accepts,
+        extension_attempts,
+        best.score - initial.score,
+        start.elapsed().as_millis()
+    );
 }
 
 fn restore_repair_candidate(
@@ -4457,6 +4701,7 @@ fn search_rotations(
     let mut proposed = Vec::with_capacity(4);
     let mut updates = Vec::with_capacity(board.pairs.len());
     let mut route_cells = Vec::with_capacity(3 * board.valid_count);
+    let mut local_workspace = LocalExtendWorkspace::new(board, &current);
     loop {
         // Time queries and powf are visible overhead on small boards, where an
         // evaluation itself is very cheap.  A slightly stale temperature is
@@ -4517,10 +4762,16 @@ fn search_rotations(
             extend_attempts += 1;
             let local_deadline =
                 (now + Duration::from_millis(LOCAL_EXTEND_BUDGET_MS)).min(deadline);
-            if let Some(candidate) =
-                local_extend_candidate(board, &current, &mut rng, local_deadline)
+            if let Some((next, candidate)) = local_extend_candidate(
+                board,
+                &current,
+                current_stats,
+                &differential,
+                &mut rng,
+                &mut local_workspace,
+                local_deadline,
+            )
             {
-                let next = board.evaluate_with_scratch(&candidate, &mut eval_scratch);
                 let next_differential = DifferentialEval::new(board, &candidate, &mut eval_scratch);
                 let diff = energy(next, next_differential.contribution_sq_sum)
                     - energy(current_stats, differential.contribution_sq_sum);
@@ -6575,6 +6826,28 @@ fn construct_initial(
     )
 }
 
+fn output_orientation(board: &Board, orientation: &[u8]) {
+    let mut moves = Vec::new();
+    for cell in 0..orientation.len() {
+        if !board.valid[cell] {
+            continue;
+        }
+        let from = board.initial[cell] as i32;
+        let to = orientation[cell] as i32;
+        let cw = (to - from + 6) % 6;
+        let ccw = (from - to + 6) % 6;
+        let (count, dir) = if cw <= ccw { (cw, 1) } else { (ccw, -1) };
+        for _ in 0..count {
+            moves.push((cell / board.W, cell % board.W, dir));
+        }
+    }
+    let mut out = io::BufWriter::new(io::stdout().lock());
+    writeln!(out, "{}", moves.len()).unwrap();
+    for (r, c, d) in moves {
+        writeln!(out, "{} {} {}", r, c, d).unwrap();
+    }
+}
+
 fn main() {
     let start = Instant::now();
     let mut sc = Scanner::new();
@@ -6812,6 +7085,22 @@ fn main() {
                 compact_stats.score
             );
         }
+        let reallocation_start = Instant::now();
+        let reallocation_ms = if board.bonus.iter().filter(|&&x| x).count()
+            >= LOW_BONUS_REALLOCATION_HIGH_BONUS_THRESHOLD
+        {
+            LOW_BONUS_REALLOCATION_HIGH_BONUS_MS
+        } else {
+            LOW_BONUS_REALLOCATION_MS
+        };
+        let reallocation_deadline =
+            (reallocation_start + Duration::from_millis(reallocation_ms)).min(deadline);
+        low_bonus_reallocation(
+            &board,
+            &mut best_orientation,
+            reallocation_start,
+            reallocation_deadline,
+        );
         let rotation_start = Instant::now();
         if has_second_sa_start {
             let remaining = deadline.saturating_duration_since(rotation_start);
@@ -6879,23 +7168,5 @@ fn main() {
         start.elapsed().as_millis()
     );
 
-    let mut moves = Vec::new();
-    for cell in 0..best_orientation.len() {
-        if !board.valid[cell] {
-            continue;
-        }
-        let from = board.initial[cell] as i32;
-        let to = best_orientation[cell] as i32;
-        let cw = (to - from + 6) % 6;
-        let ccw = (from - to + 6) % 6;
-        let (count, dir) = if cw <= ccw { (cw, 1) } else { (ccw, -1) };
-        for _ in 0..count {
-            moves.push((cell / W, cell % W, dir));
-        }
-    }
-    let mut out = io::BufWriter::new(io::stdout().lock());
-    writeln!(out, "{}", moves.len()).unwrap();
-    for (r, c, d) in moves {
-        writeln!(out, "{} {} {}", r, c, d).unwrap();
-    }
+    output_orientation(&board, &best_orientation);
 }
