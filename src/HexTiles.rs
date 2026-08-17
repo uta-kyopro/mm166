@@ -21,6 +21,9 @@ const SPECIAL_CANDIDATES: usize = 24;
 const WIDTHS: [usize; 3] = [1, 2, 3];
 const MAX_SPECIAL: usize = 3;
 const LAYERED_MAX_SPECIAL: usize = 3;
+const SMALL_HIGH_BONUS_MAX_SPECIAL: usize = 4;
+const SMALL_HIGH_BONUS_MAX_CELLS: usize = 169; // N <= 8
+const SMALL_HIGH_BONUS_MIN_BONUSES: usize = 8;
 const SKIP_FIRST_LAYERED_BEAM_MIN_CELLS: usize = 721;
 const OUTER_LAYERS: usize = 3;
 const ENABLE_LAYERED_BOARD_BEAM: bool = true;
@@ -32,6 +35,7 @@ const LAYERED_BOARD_BEAM_WIDTH: usize = 10;
 const TREE_BOARD_K_LEVELS: usize = 4;
 const ENABLE_TREE_CSP_PROPAGATION: bool = true;
 const TREE_CSP_PROPAGATION_CHECK_LIMIT: usize = 192;
+const ENABLE_COMPACT_OPTIMISTIC_REACHABILITY: bool = true;
 const PROJECTED_FREE_USE_NUM: i64 = 9;
 const PROJECTED_FREE_USE_DEN: i64 = 10;
 const PROJECTED_ROTATION_NUM: i32 = 11;
@@ -683,10 +687,35 @@ impl Board {
         moves: i32,
         scratch: &mut EvalScratch,
     ) -> Stats {
+        self.evaluate_with_moves_detail::<false>(orientation, moves, scratch)
+            .0
+    }
+
+    fn evaluate_construction_candidate(
+        &self,
+        orientation: &[u8],
+        scratch: &mut EvalScratch,
+    ) -> (Stats, usize, usize) {
+        let moves = self
+            .valid_cells
+            .iter()
+            .map(|&cell| rotation_cost(self.initial[cell], orientation[cell]))
+            .sum();
+        self.evaluate_with_moves_detail::<true>(orientation, moves, scratch)
+    }
+
+    fn evaluate_with_moves_detail<const GEOMETRY: bool>(
+        &self,
+        orientation: &[u8],
+        moves: i32,
+        scratch: &mut EvalScratch,
+    ) -> (Stats, usize, usize) {
         let mut s = Stats {
             moves,
             ..Stats::default()
         };
+        let mut used_segments = 0usize;
+        let mut shortest_sum = 0usize;
         let terminal_base = self.valid.len() * 6;
         for pair in &self.pairs {
             let epoch = scratch.next_epoch();
@@ -712,10 +741,14 @@ impl Board {
             if end == pair[1] {
                 s.matched += 1;
                 s.total += (len * (bonuses + 1)) as i64;
+                if GEOMETRY {
+                    used_segments += len;
+                    shortest_sum += pair_distance(self, *pair) + 1;
+                }
             }
         }
         s.score = (s.matched as i64 * (s.total - self.M as i64 * s.moves as i64)).max(0);
-        s
+        (s, used_segments, shortest_sum)
     }
 
     fn trace_pair(
@@ -2357,6 +2390,90 @@ fn optimistic_reachable_pairs(board: &Board, fixed: &[u8]) -> Vec<bool> {
     optimistic_reachable_connections(board, fixed, &board.pairs)
 }
 
+// Board-edge connections never change during construction. Compress every
+// adjacent pair of side ports (or boundary port + exit) once, then rebuild only
+// the tile-internal unions for each optimistic reachability query.
+struct OptimisticReachabilityScratch {
+    port_component: Vec<usize>,
+    exit_component: Vec<usize>,
+    parent: Vec<usize>,
+}
+
+impl OptimisticReachabilityScratch {
+    fn new(board: &Board) -> Self {
+        let mut port_component = vec![usize::MAX; board.valid.len() * 6];
+        let mut exit_component = vec![usize::MAX; board.exits.len()];
+        let mut component_count = 0usize;
+        for &cell in &board.valid_cells {
+            for side in 0..6 {
+                let port = cell * 6 + side;
+                if port_component[port] != usize::MAX {
+                    continue;
+                }
+                let component = component_count;
+                component_count += 1;
+                port_component[port] = component;
+                if let Some((next, next_side)) = board.next(cell, side) {
+                    port_component[next * 6 + next_side] = component;
+                } else {
+                    let exit = board.exit_id[port];
+                    if exit >= 0 {
+                        exit_component[exit as usize] = component;
+                    }
+                }
+            }
+        }
+        debug_assert!(exit_component.iter().all(|&component| component != usize::MAX));
+        Self {
+            port_component,
+            exit_component,
+            parent: (0..component_count).collect(),
+        }
+    }
+
+    #[inline]
+    fn root(&mut self, mut x: usize) -> usize {
+        while self.parent[x] != x {
+            self.parent[x] = self.parent[self.parent[x]];
+            x = self.parent[x];
+        }
+        x
+    }
+
+    #[inline]
+    fn join(&mut self, a: usize, b: usize) {
+        let a = self.root(a);
+        let b = self.root(b);
+        if a != b {
+            self.parent[b] = a;
+        }
+    }
+
+    fn reachable_pairs_into(&mut self, board: &Board, fixed: &[u8], reachable: &mut Vec<bool>) {
+        for (component, parent) in self.parent.iter_mut().enumerate() {
+            *parent = component;
+        }
+        for &cell in &board.valid_cells {
+            let components = DOMAIN_PORT_COMPONENTS[fixed[cell] as usize];
+            for side in 0..6 {
+                let local_root = components[side] as usize;
+                if local_root != side {
+                    self.join(
+                        self.port_component[cell * 6 + side],
+                        self.port_component[cell * 6 + local_root],
+                    );
+                }
+            }
+        }
+        reachable.clear();
+        for pair in &board.pairs {
+            let connected = self.root(self.exit_component[pair[0]])
+                == self.root(self.exit_component[pair[1]]);
+            reachable.push(connected);
+        }
+    }
+}
+
 #[derive(Default)]
 struct TreeCspStats {
     tested_routes: usize,
@@ -2596,34 +2713,61 @@ fn tree_board_set_cell(
     state.rotation_lower_bound += board.domain_rotation[cell][domain as usize];
 }
 
+struct TreeCspPropagationScratch {
+    queue: VecDeque<usize>,
+    queued_epoch: Vec<u32>,
+    epoch: u32,
+}
+
+impl TreeCspPropagationScratch {
+    fn new(cells: usize) -> Self {
+        Self {
+            queue: VecDeque::new(),
+            queued_epoch: vec![0; cells],
+            epoch: 0,
+        }
+    }
+
+    fn begin(&mut self) {
+        self.queue.clear();
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.queued_epoch.fill(0);
+            self.epoch = 1;
+        }
+    }
+
+    #[inline]
+    fn enqueue(&mut self, board: &Board, cell: usize) {
+        if board.valid[cell] && self.queued_epoch[cell] != self.epoch {
+            self.queued_epoch[cell] = self.epoch;
+            self.queue.push_back(cell);
+        }
+    }
+}
+
 fn tree_csp_propagate(
     board: &Board,
     state: &mut TreeBoardState,
     node: &mut TreeBoardNode,
     dsu: &mut ForcedPortDsu,
-    seed_cells: &[usize],
+    scratch: &mut TreeCspPropagationScratch,
     stats: &mut TreeCspStats,
 ) -> bool {
-    let mut queue = VecDeque::new();
-    let mut queued = vec![false; board.valid.len()];
-    let enqueue = |cell: usize, queue: &mut VecDeque<usize>, queued: &mut [bool]| {
-        if board.valid[cell] && !queued[cell] {
-            queued[cell] = true;
-            queue.push_back(cell);
-        }
-    };
-    for &cell in seed_cells {
-        enqueue(cell, &mut queue, &mut queued);
+    scratch.begin();
+    for change in &node.changes {
+        let cell = change.cell;
+        scratch.enqueue(board, cell);
         for side in 0..6 {
             if let Some((next, _)) = board.next(cell, side) {
-                enqueue(next, &mut queue, &mut queued);
+                scratch.enqueue(board, next);
             }
         }
     }
 
     let mut checks = 0usize;
-    while let Some(cell) = queue.pop_front() {
-        queued[cell] = false;
+    while let Some(cell) = scratch.queue.pop_front() {
+        scratch.queued_epoch[cell] = 0;
         if checks >= TREE_CSP_PROPAGATION_CHECK_LIMIT {
             stats.check_limit_hits += 1;
             break;
@@ -2672,10 +2816,10 @@ fn tree_csp_propagate(
         if !dsu.add_forced_domain(board, cell, new_domain) {
             return false;
         }
-        enqueue(cell, &mut queue, &mut queued);
+        scratch.enqueue(board, cell);
         for side in 0..6 {
             if let Some((next, _)) = board.next(cell, side) {
-                enqueue(next, &mut queue, &mut queued);
+                scratch.enqueue(board, next);
             }
         }
     }
@@ -2718,13 +2862,14 @@ fn tree_board_move_to(
     nodes: &[TreeBoardNode],
     current: &mut usize,
     target: usize,
+    apply_path: &mut Vec<usize>,
 ) {
     if *current == target {
         return;
     }
     let mut from = *current;
     let mut to = target;
-    let mut apply_path = Vec::new();
+    apply_path.clear();
     while nodes[from].depth > nodes[to].depth {
         tree_board_revert_node(board, state, &nodes[from]);
         from = nodes[from].parent;
@@ -2797,7 +2942,13 @@ fn run_tree_board_beam(
     } else {
         deadline
     };
-    let reachable = optimistic_reachable_pairs(board, &fixed);
+    let mut optimistic_scratch = OptimisticReachabilityScratch::new(board);
+    let mut reachable = Vec::with_capacity(board.pairs.len());
+    if ENABLE_COMPACT_OPTIMISTIC_REACHABILITY {
+        optimistic_scratch.reachable_pairs_into(board, &fixed, &mut reachable);
+    } else {
+        reachable = optimistic_reachable_pairs(board, &fixed);
+    }
     let rotated_tile_count = board
         .valid_cells
         .iter()
@@ -2840,9 +2991,14 @@ fn run_tree_board_beam(
         ))
     };
     let mut current = 0usize;
+    let mut apply_path = Vec::new();
     let mut reachability_calls = 1usize;
     let mut expanded = 0usize;
     let mut reverse_scratch = ReverseBfsScratch::new(board.valid.len() * 6);
+    let mut forced_dsu_scratch = ENABLE_TREE_CSP_PROPAGATION.then(|| ForcedPortDsu::new(board));
+    let mut csp_propagation_scratch = TreeCspPropagationScratch::new(board.valid.len());
+    let mut before_reachable = Vec::with_capacity(board.pairs.len());
+    let mut after_reachable = Vec::with_capacity(board.pairs.len());
     let mut archive_updates = 0usize;
     let mut csp_stats = TreeCspStats::default();
 
@@ -2854,7 +3010,14 @@ fn run_tree_board_beam(
             let pair = board.pairs[id];
             let mut next_beam = Vec::with_capacity(beam.len() * (LAYERED_ROUTE_CANDIDATES + 1));
             for candidate in &beam {
-                tree_board_move_to(board, &mut state, &nodes, &mut current, candidate.node);
+                tree_board_move_to(
+                    board,
+                    &mut state,
+                    &nodes,
+                    &mut current,
+                    candidate.node,
+                    &mut apply_path,
+                );
                 next_beam.push(candidate.clone());
                 if state.connected[id] || Instant::now() >= search_deadline {
                     continue;
@@ -2890,16 +3053,21 @@ fn run_tree_board_beam(
                     .into_iter()
                     .filter(|route| route.length == shortest)
                     .collect();
-                let mut forced_dsu = if ENABLE_TREE_CSP_PROPAGATION {
-                    let mut dsu = ForcedPortDsu::new(board);
+                if let Some(dsu) = forced_dsu_scratch.as_mut() {
+                    dsu.rollback(0);
                     if !dsu.add_all_domains(board, &state.fixed) {
                         continue;
                     }
-                    Some(dsu)
+                }
+                if ENABLE_COMPACT_OPTIMISTIC_REACHABILITY {
+                    optimistic_scratch.reachable_pairs_into(
+                        board,
+                        &state.fixed,
+                        &mut before_reachable,
+                    );
                 } else {
-                    None
-                };
-                let before = optimistic_reachable_pairs(board, &state.fixed);
+                    before_reachable = optimistic_reachable_pairs(board, &state.fixed);
+                }
                 reachability_calls += 1;
                 let mut accepted_shortest = false;
                 let mut loaded_detours = false;
@@ -2953,12 +3121,12 @@ fn run_tree_board_beam(
                         keep_domains,
                         nodes[candidate.node].depth,
                     );
-                    let propagation_seeds: Vec<usize> =
-                        node.changes.iter().map(|change| change.cell).collect();
                     tree_board_apply_node(board, &mut state, &node);
-                    let dsu_snapshot = forced_dsu.as_ref().map_or(0, ForcedPortDsu::snapshot);
+                    let dsu_snapshot = forced_dsu_scratch
+                        .as_ref()
+                        .map_or(0, ForcedPortDsu::snapshot);
                     let mut csp_ok = true;
-                    if let Some(dsu) = forced_dsu.as_mut() {
+                    if let Some(dsu) = forced_dsu_scratch.as_mut() {
                         csp_stats.tested_routes += 1;
                         for change in &node.changes {
                             if !dsu.add_forced_domain(board, change.cell, change.new_domain) {
@@ -2972,7 +3140,7 @@ fn run_tree_board_beam(
                                 &mut state,
                                 &mut node,
                                 dsu,
-                                &propagation_seeds,
+                                &mut csp_propagation_scratch,
                                 &mut csp_stats,
                             );
                         }
@@ -2980,20 +3148,31 @@ fn run_tree_board_beam(
                     if !csp_ok {
                         csp_stats.rejected_routes += 1;
                         tree_board_revert_node(board, &mut state, &node);
-                        if let Some(dsu) = forced_dsu.as_mut() {
+                        if let Some(dsu) = forced_dsu_scratch.as_mut() {
                             dsu.rollback(dsu_snapshot);
                         }
                         continue;
                     }
-                    let after = optimistic_reachable_pairs(board, &state.fixed);
+                    if ENABLE_COMPACT_OPTIMISTIC_REACHABILITY {
+                        optimistic_scratch.reachable_pairs_into(
+                            board,
+                            &state.fixed,
+                            &mut after_reachable,
+                        );
+                    } else {
+                        after_reachable = optimistic_reachable_pairs(board, &state.fixed);
+                    }
                     reachability_calls += 1;
                     let keeps_future_open = (0..board.pairs.len()).all(|other| {
-                        state.connected[other] || other == id || !before[other] || after[other]
+                        state.connected[other]
+                            || other == id
+                            || !before_reachable[other]
+                            || after_reachable[other]
                     });
                     let child_rotated_tile_count = state.rotated_tile_count;
                     let child_rotation_lower_bound = state.rotation_lower_bound;
                     tree_board_revert_node(board, &mut state, &node);
-                    if let Some(dsu) = forced_dsu.as_mut() {
+                    if let Some(dsu) = forced_dsu_scratch.as_mut() {
                         dsu.rollback(dsu_snapshot);
                     }
                     if keeps_future_open {
@@ -3006,7 +3185,10 @@ fn run_tree_board_beam(
                         next_beam.push(TreeBoardCandidate {
                             node: next_node,
                             connected_count: candidate.connected_count + 1,
-                            optimistic_count: after.iter().filter(|&&value| value).count(),
+                            optimistic_count: after_reachable
+                                .iter()
+                                .filter(|&&value| value)
+                                .count(),
                             route_length: candidate.route_length + route.length,
                             rotated_tile_count: child_rotated_tile_count,
                             rotation_lower_bound: child_rotation_lower_bound,
@@ -3051,23 +3233,21 @@ fn run_tree_board_beam(
     let mut eval_scratch = EvalScratch::new(board.valid.len());
     let mut scored = Vec::with_capacity(beam.len());
     for candidate in &beam {
-        tree_board_move_to(board, &mut state, &nodes, &mut current, candidate.node);
-        let stats = board.evaluate_with_scratch(&state.orientation, &mut eval_scratch);
+        tree_board_move_to(
+            board,
+            &mut state,
+            &nodes,
+            &mut current,
+            candidate.node,
+            &mut apply_path,
+        );
+        let (stats, used_segments, shortest_sum) =
+            board.evaluate_construction_candidate(&state.orientation, &mut eval_scratch);
         archive_updates += usize::from(store_construction_archive(
             archive,
             stats,
             &state.orientation,
         ));
-        let mut used_segments = 0usize;
-        let mut shortest_sum = 0usize;
-        for id in 0..board.pairs.len() {
-            let (value, length) = board.trace_pair(&state.orientation, id, &mut eval_scratch, None);
-            if value <= 0 || length <= 0 {
-                continue;
-            }
-            used_segments += length as usize;
-            shortest_sum += pair_distance(board, board.pairs[id]) + 1;
-        }
         let free_segments = (3 * board.valid_count).saturating_sub(used_segments);
         let projected_extra = if used_segments == 0 {
             free_segments as i64 * PROJECTED_FREE_USE_NUM / PROJECTED_FREE_USE_DEN
@@ -3116,7 +3296,14 @@ fn run_tree_board_beam(
         projected_total,
         shortest_sum,
     ) = scored[chosen_index].clone();
-    tree_board_move_to(board, &mut state, &nodes, &mut current, chosen.node);
+    tree_board_move_to(
+        board,
+        &mut state,
+        &nodes,
+        &mut current,
+        chosen.node,
+        &mut apply_path,
+    );
     eprintln!(
         "tree_board_beam nodes={} expanded={} reachability={} csp_tested={} csp_rejected={} csp_domain_changes={} csp_removed={} csp_checks={} csp_limits={} route_detours={}/{} archive={}/{} tracked_k={} exact_k={} exact_score={} projected_score={} projected_t={} projected_m={} used={} shortest={} detour={} free={} bonuses={} avg_multiplier_milli={} segments={} rotated={} rotation_lb={} elapsed_ms={}",
         nodes.len(), expanded, reachability_calls,
@@ -8363,6 +8550,14 @@ fn construct_initial(
     // The one-special pass mainly improves the move-count sample.  On large
     // boards its rotation term is small, so let the existing final-move
     // regression extrapolate from the two/three-special construction instead.
+    let bonus_count = board.bonus.iter().filter(|&&is_bonus| is_bonus).count();
+    let max_special = if board.valid_count <= SMALL_HIGH_BONUS_MAX_CELLS
+        && bonus_count >= SMALL_HIGH_BONUS_MIN_BONUSES
+    {
+        SMALL_HIGH_BONUS_MAX_SPECIAL
+    } else {
+        LAYERED_MAX_SPECIAL
+    };
     let first_special_count = if board.valid_count >= SKIP_FIRST_LAYERED_BEAM_MIN_CELLS
         && specials.len() >= 2
     {
@@ -8370,7 +8565,7 @@ fn construct_initial(
     } else {
         1
     };
-    for count in first_special_count..=LAYERED_MAX_SPECIAL.min(specials.len()) {
+    for count in first_special_count..=max_special.min(specials.len()) {
         if Instant::now() >= first_deadline {
             break;
         }

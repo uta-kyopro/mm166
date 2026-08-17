@@ -660,6 +660,43 @@ Despite the smooth definition, the auxiliary did not improve final score.  At 9.
 - For `valid_count >= 721` (roughly `N >= 16`), skip only this first variant. The surviving construction's measured moves still feed the existing final-move regression, so connection-target estimation keeps its calibrated rotation estimate without spending a separate beam pass solely for it.
 - Seeds 1--10 scored `mean_log10=5.175546` versus `5.175489` in the immediately preceding rerun, a geometric change of `+0.013%`, so the large-board skip was neutral. Extending the threshold to 469 cells scored `5.174688` (`-0.184%`) and was rejected. A more aggressive `N >= 10` threshold (271 cells) scored `5.175067` and `5.175182`; its two-run average was about `-0.097%` versus the 721-cell version. Keep the conservative 721-cell threshold.
 
+### Extra bonus-trunk construction variant for small high-bonus boards
+
+- A parameter-controlled benchmark used `N=3..8`, `B=8..10`, random `M=1..5`, and seeds 1--10. Its baseline was `mean_log10=4.552311`.
+- Increasing the layered construction's maximum reserved bonus trunks from three to four scored `4.553864`, a geometric gain of `+0.358%` with 5 wins, 3 losses, and 2 ties. Five trunks regressed to `4.552665` (`+0.082%`, 4 wins and 4 losses), so the useful diversity ends at four.
+- Retain the fourth construction variant only for `N <= 8` (`valid_count <= 169`) and `B >= 8`; all other boards keep the three-variant portfolio. Standard seeds 1--10 scored `5.175388`, within `-0.02%` to `-0.04%` of adjacent reruns; none of those inputs triggered the new condition, so this difference is downstream time noise.
+
+### Large high-bonus construction-portfolio audit
+
+- A parameter-controlled benchmark with `N=15..20`, `B=8..10`, random `M=1..5`, and seeds 1--10 scored `mean_log10=6.335726` with the normal three reserved-trunk variants.
+- Four variants scored `6.332386`, a geometric loss of `-0.766%`; the extra large-board beam takes too much time from downstream search. Two variants initially looked promising: runs scored `6.338843` and `6.338239`, averaging `+0.650%` versus the three-variant baseline.
+- The two-variant condition was not robust. Standard seeds 1--10 fell to `5.173854` (about `-0.39%`), including roughly `-1.1%` on the known `N=16,B=8` seed 8. Restricting the parameter benchmark to `N=17..20,B=8..10` also reversed the result: two variants scored `6.434566` versus `6.445180` for three, a geometric loss of `-2.414%`, because one case gained about 29% from the third construction.
+- Keep three variants on large boards. Board size and bonus count alone cannot identify when the third variant is redundant; skipping it would need an online similarity/quality test after the second construction rather than a static parameter threshold.
+
+### Construction-DSU acceleration
+
+- Optimistic reachability was rewritten experimentally to precompress invariant neighbor-port and boundary-exit edges, reuse its DSU allocation, and union only tile-internal domain components per query. The rollback CSP DSU was also allocated once per tree-beam pass and reset to snapshot zero for every parent instead of rebuilding all static neighbor unions.
+- On `N=15..20,B=8..10` seeds 1--10, average tree-beam time fell from 645.9ms to 392.8ms (`-39%`) and whole construction from 978.3ms to 711.4ms (`-25%`). Construction boards and scores were identical, so the optimization itself was correct.
+- The earlier rotation-SA start changed the deterministic time-normalized trajectory. Targeted final `mean_log10` fell from `6.336848` to `6.327734`; standard seeds 1--10 scored `5.174519` and `5.174637`, averaging about `-0.22%` versus `5.175546`. These score differences are not an acceleration metric because the solver is time-limited and the search trajectory changes when phases start earlier.
+- Reinvesting the saved time did not recover robustly. A fourth reserved trunk raised construction to 1.092s and remained about `-0.29%` versus the old targeted run; large beam width 12 was much worse; five route candidates remained about `-1.15%`; extending path reallocation from 400ms to 650ms made standard seeds about `-0.56%` worse.
+- Retain the acceleration based on identical construction results and measured speed. Under the four-thread parameter benchmark, average rotation iterations changed from 885,683 to 855,194 and compact-SA iterations from 21,088 to 19,558 because faster cases overlap more heavily and increase CPU contention; therefore wall-clock phase speed is the reliable metric in that parallel run. A single-process or fixed-work benchmark should be used when tuning how the saved time is consumed.
+- The retained accelerated solver completed standard seeds 1--100 with zero failures, `mean_log10=5.192109`, average runtime 9.709s, and maximum runtime 9.785s. Against `unified_latest100=5.190008`, the geometric gain was `+0.485%` with 56 wins, 37 losses, and 7 ties; excluding seed 98 it remained `+0.480%`.
+- By board-size bucket versus the same baseline, gains were `+0.976%` for `N=3..8` (31 cases), `+0.296%` for `N=9..14` (32), and `+0.238%` for `N=15..20` (37). Seed 98 recovered from the old `712077` best to `718867`, confirming that the restored construction order remains intact under the DSU optimization.
+
+### Follow-up allocation removal in the construction beam
+
+- Reuse one propagation queue and an epoch-marked queued array for the local CSP pass. Seed it directly from the route node's changed cells instead of first building a temporary seed vector. On `N=15..20,B=8..10` seeds 1--10, average tree-beam time fell from 392.8ms to 379.7ms (`-3.3%`) and whole construction from 711.4ms to 697.3ms (`-2.0%`). In the four-thread run, rotation-SA iterations rose by about `5.9%`.
+- Reuse the optimistic-reachability before/after pair buffers and the tree-state apply-path buffer. These are individually small and noisy improvements, but remove allocations from hot loops without changing the constructed state.
+- Gather matched-path length and shortest-distance totals while doing the final detailed construction evaluation. This removes the immediate second full trace over all pairs; the targeted tree-beam average improved from 377.4ms to 373.2ms (`-1.1%`).
+- Converting the compact optimistic DSU's ids and parents from `usize` to `u16` was slower (tree beam 377.4ms to 384.1ms), presumably due to repeated widening on indexing. A precomputed table of forced partners for all domain masks was also slower (373.2ms to 381.6ms). Revert both; reduced representation size is not automatically useful when the hot operation needs native-width array indices.
+- The retained follow-up version completed standard seeds 1--10 with zero failures, average runtime 9.717s, maximum runtime 9.780s, and `mean_log10=5.174905`. Final-score movement is not the adoption criterion for these semantics-preserving changes; use fixed-work phase time and iteration throughput.
+
+### Rotation-SA cycle boundary recheck
+
+- Large boards already use one uninterrupted final rotation-SA cooling cycle at `valid_count >= 721` (`N >= 16`); smaller boards use three reheated cycles. This changes the search trajectory but not its deadline or raw iteration throughput.
+- Extending the one-cycle boundary to `valid_count >= 631` was tested on fixed `N=15`, random `B=1..10,M=1..5`, seeds 1--10. One cycle scored `mean_log10=5.771930` versus `5.771903` for three cycles, only `+0.006%` geometrically (4 wins, 5 losses, 1 tie), so the change is effectively neutral.
+- Keep the 721-cell boundary. The earlier extension to 469 cells was harmful, and N=15 provides no evidence strong enough to broaden the single-cycle range.
+
 ### compact SA温度の再調整
 
 - 区間短絡近傍を統合した現行版で、seed 1〜10を`2e6→100`（基準）、`1e6→100`、`3e6→100`、`4e6→100`、`2e6→1000`で比較した。`mean_log10`は順に`5.176269`, `5.175114`, `5.175891`, `5.175999`, `5.175017`。低い開始温度と高い終了温度はそれぞれ幾何平均`-0.266%`, `-0.288%`で明確に悪化した。
