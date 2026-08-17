@@ -31,7 +31,6 @@ const COMPLETE_TREE_BOARD_BEAM: bool = true;
 const COMPLETE_TREE_BOARD_BEAM_SAFETY_MS: u64 = 60_000;
 const LAYERED_BOARD_BEAM_WIDTH: usize = 10;
 const TREE_BOARD_K_LEVELS: usize = 4;
-const TREE_BOARD_MAX_K_DIVERSE_STATES: usize = 4;
 const PROJECTED_FREE_USE_NUM: i64 = 9;
 const PROJECTED_FREE_USE_DEN: i64 = 10;
 const PROJECTED_ROTATION_NUM: i32 = 11;
@@ -40,9 +39,6 @@ const LAYERED_DEFERRED_RESERVED_STATES: usize = 0;
 const LAYERED_ROUTE_CANDIDATES: usize = 4;
 const LAYERED_DEFERRED_CHOICES: usize = 1;
 const LAYERED_DEFERRED_ASSIGNMENTS: usize = 4;
-const ENABLE_EXACT_CSP_CONSTRUCTION: bool = false;
-const EXACT_CSP_CONSTRUCTION_MS: u64 = 300;
-const EXACT_CSP_PRESERVED_TRUNKS: usize = 3;
 const ENABLE_SECOND_CONSTRUCTION_BEAM: bool = true;
 const SECOND_CONSTRUCTION_BEAM_WIDTH: usize = 8;
 const SECOND_CONSTRUCTION_ROUTE_CANDIDATES: usize = 4;
@@ -2370,439 +2366,6 @@ struct TreeBoardState {
     rotation_lower_bound: i32,
 }
 
-struct CspDsuChange {
-    root: usize,
-    child: usize,
-    root_size: usize,
-    root_exit_count: u8,
-    root_exit_a: usize,
-    root_exit_b: usize,
-}
-
-struct RollbackPortDsu {
-    parent: Vec<usize>,
-    size: Vec<usize>,
-    exit_count: Vec<u8>,
-    exit_a: Vec<usize>,
-    exit_b: Vec<usize>,
-    history: Vec<CspDsuChange>,
-}
-
-impl RollbackPortDsu {
-    fn new(port_nodes: usize, exit_count: usize) -> Self {
-        let total = port_nodes + exit_count;
-        let mut result = Self {
-            parent: (0..total).collect(),
-            size: vec![1; total],
-            exit_count: vec![0; total],
-            exit_a: vec![usize::MAX; total],
-            exit_b: vec![usize::MAX; total],
-            history: Vec::new(),
-        };
-        for exit in 0..exit_count {
-            let node = port_nodes + exit;
-            result.exit_count[node] = 1;
-            result.exit_a[node] = exit;
-        }
-        result
-    }
-
-    #[inline]
-    fn find(&self, mut node: usize) -> usize {
-        while self.parent[node] != node {
-            node = self.parent[node];
-        }
-        node
-    }
-
-    #[inline]
-    fn snapshot(&self) -> usize {
-        self.history.len()
-    }
-
-    fn rollback(&mut self, snapshot: usize) {
-        while self.history.len() > snapshot {
-            let change = self.history.pop().unwrap();
-            self.parent[change.child] = change.child;
-            self.size[change.root] = change.root_size;
-            self.exit_count[change.root] = change.root_exit_count;
-            self.exit_a[change.root] = change.root_exit_a;
-            self.exit_b[change.root] = change.root_exit_b;
-        }
-    }
-
-    fn union(&mut self, a: usize, b: usize, partner: &[usize]) -> bool {
-        let mut ra = self.find(a);
-        let mut rb = self.find(b);
-        if ra == rb {
-            return true;
-        }
-        let combined_count = self.exit_count[ra] + self.exit_count[rb];
-        if combined_count > 2 {
-            return false;
-        }
-        let mut exits = [usize::MAX; 2];
-        let mut count = 0usize;
-        for root in [ra, rb] {
-            if self.exit_count[root] >= 1 {
-                exits[count] = self.exit_a[root];
-                count += 1;
-            }
-            if self.exit_count[root] >= 2 {
-                exits[count] = self.exit_b[root];
-                count += 1;
-            }
-        }
-        if count == 2 && partner[exits[0]] != exits[1] {
-            return false;
-        }
-        if self.size[ra] < self.size[rb] {
-            std::mem::swap(&mut ra, &mut rb);
-        }
-        self.history.push(CspDsuChange {
-            root: ra,
-            child: rb,
-            root_size: self.size[ra],
-            root_exit_count: self.exit_count[ra],
-            root_exit_a: self.exit_a[ra],
-            root_exit_b: self.exit_b[ra],
-        });
-        self.parent[rb] = ra;
-        self.size[ra] += self.size[rb];
-        self.exit_count[ra] = combined_count;
-        self.exit_a[ra] = exits[0];
-        self.exit_b[ra] = exits[1];
-        true
-    }
-}
-
-struct ExactCspSearch {
-    dsu: RollbackPortDsu,
-    orientation: Vec<u8>,
-    assigned: Vec<bool>,
-    domains: Vec<u8>,
-    congestion: Vec<usize>,
-    best_orientation: Option<Vec<u8>>,
-    best_cost: i32,
-    nodes: usize,
-    forced: usize,
-    solutions: usize,
-    timed_out: bool,
-}
-
-fn csp_apply_orientation(
-    board: &Board,
-    dsu: &mut RollbackPortDsu,
-    cell: usize,
-    orientation: u8,
-) -> bool {
-    let snapshot = dsu.snapshot();
-    for enter in 0..6 {
-        let out = paired_dir(orientation, enter);
-        if enter < out
-            && !dsu.union(cell * 6 + enter, cell * 6 + out, &board.partner)
-        {
-            dsu.rollback(snapshot);
-            return false;
-        }
-    }
-    true
-}
-
-fn csp_boundary_congestion(board: &Board) -> Vec<usize> {
-    let exits = board.exits.len();
-    let mut difference = vec![0isize; exits + 1];
-    for pair in &board.pairs {
-        let a = pair[0].min(pair[1]);
-        let b = pair[0].max(pair[1]);
-        difference[a] += 1;
-        difference[b] -= 1;
-    }
-    let mut cut_demand = vec![0usize; exits];
-    let mut current = 0isize;
-    for cut in 0..exits {
-        current += difference[cut];
-        cut_demand[cut] = current as usize;
-    }
-    let mut congestion = vec![0usize; board.valid.len()];
-    for (exit, &(cell, _)) in board.exits.iter().enumerate() {
-        congestion[cell] = congestion[cell]
-            .max(cut_demand[exit])
-            .max(cut_demand[(exit + exits - 1) % exits]);
-    }
-    congestion
-}
-
-fn exact_csp_dfs(board: &Board, search: &mut ExactCspSearch, current_cost: i32, deadline: Instant) {
-    search.nodes += 1;
-    if Instant::now() >= deadline {
-        search.timed_out = true;
-        return;
-    }
-    let mut selected = usize::MAX;
-    let mut selected_mask = 0u8;
-    let mut selected_count = 7u32;
-    let mut selected_frontier = 0usize;
-    let mut selected_frontier_size = 0usize;
-    let mut lower_bound = current_cost;
-    for &cell in &board.valid_cells {
-        if search.assigned[cell] {
-            continue;
-        }
-        let mut feasible = 0u8;
-        let mut min_cost = i32::MAX;
-        for orientation in 0..6u8 {
-            if search.domains[cell] >> orientation & 1 == 0 {
-                continue;
-            }
-            let snapshot = search.dsu.snapshot();
-            if csp_apply_orientation(board, &mut search.dsu, cell, orientation) {
-                feasible |= 1 << orientation;
-                min_cost = min_cost.min(rotation_cost(board.initial[cell], orientation));
-            }
-            search.dsu.rollback(snapshot);
-        }
-        let count = feasible.count_ones();
-        if count == 0 {
-            return;
-        }
-        lower_bound += min_cost;
-        let mut roots = [usize::MAX; 6];
-        let mut root_count = 0usize;
-        let mut frontier = 0usize;
-        let mut frontier_size = 0usize;
-        for side in 0..6 {
-            let root = search.dsu.find(cell * 6 + side);
-            if roots[..root_count].contains(&root) {
-                continue;
-            }
-            roots[root_count] = root;
-            root_count += 1;
-            if search.dsu.exit_count[root] > 0 {
-                frontier += 1;
-                frontier_size += search.dsu.size[root];
-            }
-        }
-        if count < selected_count
-            || (count == selected_count
-                && selected != usize::MAX
-                && (
-                    frontier,
-                    frontier_size,
-                    search.congestion[cell],
-                    Reverse(board.boundary_depth[cell]),
-                    Reverse(cell),
-                ) > (
-                    selected_frontier,
-                    selected_frontier_size,
-                    search.congestion[selected],
-                    Reverse(board.boundary_depth[selected]),
-                    Reverse(selected),
-                ))
-        {
-            selected = cell;
-            selected_mask = feasible;
-            selected_count = count;
-            selected_frontier = frontier;
-            selected_frontier_size = frontier_size;
-        }
-    }
-    if lower_bound >= search.best_cost {
-        return;
-    }
-    if selected == usize::MAX {
-        search.solutions += 1;
-        let safe = board.tester_safe(&search.orientation);
-        let stats = board.evaluate(&search.orientation);
-        if safe {
-            if stats.matched == board.pairs.len() && stats.moves < search.best_cost {
-                search.best_cost = stats.moves;
-                search.best_orientation = Some(search.orientation.clone());
-            }
-        }
-        return;
-    }
-    search.forced += usize::from(selected_count == 1);
-    let mut choices = [u8::MAX; 6];
-    let mut choice_count = 0usize;
-    for orientation in 0..6u8 {
-        if selected_mask >> orientation & 1 != 0 {
-            choices[choice_count] = orientation;
-            choice_count += 1;
-        }
-    }
-    choices[..choice_count].sort_unstable_by_key(|&orientation| {
-        (
-            rotation_cost(board.initial[selected], orientation),
-            usize::from(orientation != search.orientation[selected]),
-            orientation,
-        )
-    });
-    for &orientation in &choices[..choice_count] {
-        if search.timed_out {
-            break;
-        }
-        let snapshot = search.dsu.snapshot();
-        if !csp_apply_orientation(board, &mut search.dsu, selected, orientation) {
-            search.dsu.rollback(snapshot);
-            continue;
-        }
-        let previous = search.orientation[selected];
-        search.orientation[selected] = orientation;
-        search.assigned[selected] = true;
-        exact_csp_dfs(
-            board,
-            search,
-            current_cost + rotation_cost(board.initial[selected], orientation),
-            deadline,
-        );
-        search.assigned[selected] = false;
-        search.orientation[selected] = previous;
-        search.dsu.rollback(snapshot);
-    }
-}
-
-fn exact_csp_complete(
-    board: &Board,
-    orientation: &[u8],
-    domains: &[u8],
-    deadline: Instant,
-) -> Option<Vec<u8>> {
-    let started = Instant::now();
-    let port_nodes = board.valid.len() * 6;
-    let mut dsu = RollbackPortDsu::new(port_nodes, 0);
-    for (exit, &(cell, side)) in board.exits.iter().enumerate() {
-        let port = cell * 6 + side;
-        dsu.exit_count[port] = 1;
-        dsu.exit_a[port] = exit;
-    }
-    for &cell in &board.valid_cells {
-        for side in 0..6 {
-            let port = cell * 6 + side;
-            if board.neighbors[cell][side] != usize::MAX {
-                let target = board.neighbors[cell][side] * 6 + (side + 3) % 6;
-                let joined = dsu.union(port, target, &board.partner);
-                debug_assert!(joined);
-            }
-        }
-    }
-    dsu.history.clear();
-    let mut search = ExactCspSearch {
-        dsu,
-        orientation: orientation.to_vec(),
-        assigned: vec![false; board.valid.len()],
-        domains: domains.to_vec(),
-        congestion: csp_boundary_congestion(board),
-        best_orientation: None,
-        best_cost: i32::MAX,
-        nodes: 0,
-        forced: 0,
-        solutions: 0,
-        timed_out: false,
-    };
-    let mut fixed_cost = 0i32;
-    let mut fixed_count = 0usize;
-    let mut fixed_ok = true;
-    let mut fixed_cells: Vec<usize> = board
-        .valid_cells
-        .iter()
-        .copied()
-        .filter(|&cell| domains[cell].count_ones() == 1)
-        .collect();
-    fixed_cells.sort_unstable_by_key(|&cell| Reverse(search.congestion[cell]));
-    for cell in fixed_cells {
-        let selected = domains[cell].trailing_zeros() as u8;
-        if !csp_apply_orientation(board, &mut search.dsu, cell, selected) {
-            fixed_ok = false;
-            break;
-        }
-        search.orientation[cell] = selected;
-        search.assigned[cell] = true;
-        fixed_cost += rotation_cost(board.initial[cell], selected);
-        fixed_count += 1;
-    }
-    if fixed_ok {
-        exact_csp_dfs(board, &mut search, fixed_cost, deadline);
-    }
-    eprintln!(
-        "exact_csp fixed={} free={} nodes={} forced={} solutions={} best_cost={} timeout={} elapsed_ms={}",
-        fixed_count,
-        board.valid_count.saturating_sub(fixed_count),
-        search.nodes,
-        search.forced,
-        search.solutions,
-        if search.best_cost == i32::MAX { -1 } else { search.best_cost },
-        search.timed_out,
-        started.elapsed().as_millis(),
-    );
-    search.best_orientation
-}
-
-fn exact_csp_repair_matched_paths(
-    board: &Board,
-    orientation: &[u8],
-    deadline: Instant,
-) -> Option<Vec<u8>> {
-    let started = Instant::now();
-    let mut domains = vec![0u8; board.valid.len()];
-    for &cell in &board.valid_cells {
-        domains[cell] = ALL_ORIENTATIONS;
-    }
-    let mut scratch = EvalScratch::new(board.valid.len());
-    let mut ranked = Vec::new();
-    for id in 0..board.pairs.len() {
-        let (value, length) = board.trace_pair(orientation, id, &mut scratch, None);
-        if value > 0 && length > 0 {
-            ranked.push((value / length - 1, value, length, id));
-        }
-    }
-    ranked.sort_unstable_by_key(|&(bonuses, value, length, id)| {
-        (Reverse(bonuses), Reverse(value), Reverse(length), id)
-    });
-    let mut preserved = 0usize;
-    for &(_, _, _, id) in ranked.iter().take(EXACT_CSP_PRESERVED_TRUNKS) {
-        preserved += 1;
-        let (mut cell, mut enter) = board.exits[board.pairs[id][0]];
-        for _ in 0..=3 * board.valid_count {
-            let out = paired_dir(orientation[cell], enter);
-            let mut required = 0u8;
-            for candidate in 0..6u8 {
-                if paired_dir(candidate, enter) == out {
-                    required |= 1 << candidate;
-                }
-            }
-            domains[cell] &= required;
-            if domains[cell] == 0 {
-                eprintln!(
-                    "exact_csp_repair preserved={} conflict=true elapsed_ms={}",
-                    preserved,
-                    started.elapsed().as_millis(),
-                );
-                return None;
-            }
-            let Some((next, next_enter)) = board.next(cell, out) else {
-                break;
-            };
-            cell = next;
-            enter = next_enter;
-        }
-    }
-    let result = exact_csp_complete(board, orientation, &domains, deadline);
-    if let Some(candidate) = &result {
-        let stats = board.evaluate(candidate);
-        eprintln!(
-            "exact_csp_repair preserved={} k={} t={} m={} score={} elapsed_ms={}",
-            preserved,
-            stats.matched,
-            stats.total,
-            stats.moves,
-            stats.score,
-            started.elapsed().as_millis(),
-        );
-    }
-    result
-}
-
 #[derive(Clone)]
 struct TreeBoardCandidate {
     node: usize,
@@ -3106,48 +2669,7 @@ fn run_tree_board_beam(
                 .connected_count;
             let mut selected = Vec::with_capacity(LAYERED_BOARD_BEAM_WIDTH);
             let mut selected_nodes = HashSet::with_capacity(LAYERED_BOARD_BEAM_WIDTH);
-            // Do not let one cheap-looking shortest route monopolize the beam.
-            // At the current maximum k, retain states preferred by different
-            // resource metrics before reserving the usual lower-k fallbacks.
-            for metric in 0..TREE_BOARD_MAX_K_DIVERSE_STATES {
-                let candidate = next_beam
-                    .iter()
-                    .filter(|candidate| {
-                        candidate.connected_count == max_connected
-                            && !selected_nodes.contains(&candidate.node)
-                    })
-                    .min_by_key(|candidate| match metric {
-                        0 => (
-                            candidate.rotation_lower_bound as i64,
-                            candidate.route_length,
-                            usize::MAX - candidate.optimistic_count,
-                            candidate.rotated_tile_count,
-                        ),
-                        1 => (
-                            -(candidate.optimistic_count as i64),
-                            candidate.rotation_lower_bound.max(0) as usize,
-                            candidate.route_length,
-                            candidate.rotated_tile_count,
-                        ),
-                        2 => (
-                            candidate.route_length as i64,
-                            usize::MAX - candidate.optimistic_count,
-                            candidate.rotation_lower_bound.max(0) as usize,
-                            candidate.rotated_tile_count,
-                        ),
-                        _ => (
-                            candidate.rotated_tile_count as i64,
-                            usize::MAX - candidate.optimistic_count,
-                            candidate.rotation_lower_bound.max(0) as usize,
-                            candidate.route_length,
-                        ),
-                    });
-                if let Some(candidate) = candidate {
-                    selected_nodes.insert(candidate.node);
-                    selected.push(candidate.clone());
-                }
-            }
-            for delta in 1..TREE_BOARD_K_LEVELS {
+            for delta in 0..TREE_BOARD_K_LEVELS {
                 let Some(target_connected) = max_connected.checked_sub(delta) else {
                     break;
                 };
@@ -3258,7 +2780,6 @@ fn build_layered_with_specials(
     board: &Board,
     archive: &mut Vec<ConstructionArchiveEntry>,
     reserved: &[usize],
-    order_variant: usize,
     keep_domains: bool,
     use_two_exit_direct: bool,
     outer_deadline: Instant,
@@ -3283,18 +2804,7 @@ fn build_layered_with_specials(
     let mut order: Vec<usize> = (0..board.pairs.len())
         .filter(|id| !reserved.contains(id))
         .collect();
-    order.sort_unstable_by_key(|&id| {
-        let distance = pair_distance(board, board.pairs[id]);
-        let priority = ordinary_pair_priority(board, board.pairs[id]);
-        let tie = match order_variant % 3 {
-            0 => 0,
-            // Among equally ranked pairs, try the more contended diagonal
-            // displacement first in one construction and last in another.
-            1 => distance,
-            _ => usize::MAX - distance,
-        };
-        (priority, tie, id)
-    });
+    order.sort_unstable_by_key(|&id| ordinary_pair_priority(board, board.pairs[id]));
     if ENABLE_LAYERED_BOARD_BEAM && ENABLE_TREE_BOARD_BEAM && !ENABLE_DEFERRED_ROUTE_CHOICES {
         let (next_orientation, next_fixed, next_layer_counts) = run_tree_board_beam(
             board,
@@ -8502,7 +8012,6 @@ fn construct_initial(
             board,
             &mut archive,
             reserved,
-            count - 1,
             count > 1,
             DIRECT_TWO_EXIT_IN_LAYERED,
             outer_deadline,
@@ -8521,23 +8030,6 @@ fn construct_initial(
         if stats.score > best_stats.score && board.tester_safe(&candidate) {
             best_stats = stats;
             best_orientation = candidate;
-        }
-    }
-    if ENABLE_EXACT_CSP_CONSTRUCTION
-        && best_stats.matched < board.pairs.len()
-        && Instant::now() < first_deadline
-    {
-        let csp_deadline =
-            (Instant::now() + Duration::from_millis(EXACT_CSP_CONSTRUCTION_MS)).min(first_deadline);
-        if let Some(candidate) =
-            exact_csp_repair_matched_paths(board, &best_orientation, csp_deadline)
-        {
-            let stats = board.evaluate(&candidate);
-            store_construction_archive(&mut archive, stats, &candidate);
-            if stats.score > best_stats.score && board.tester_safe(&candidate) {
-                best_stats = stats;
-                best_orientation = candidate;
-            }
         }
     }
     if ENABLE_LEGACY_CONSTRUCTION {
