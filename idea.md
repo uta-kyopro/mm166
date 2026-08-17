@@ -601,3 +601,27 @@ Despite the smooth definition, the auxiliary did not improve final score.  At 9.
 - tree board beam幅10は増やさず、現在の最大kについて、回転下界・将来接続可能数・累積経路長・変更タイル数を別々に重視する4状態を先に予約する。seed 1〜10で`mean_log10=5.176173→5.176591`、幾何平均+0.096%、5勝3敗2分だった。
 - special予約数の異なる3回のconstructionで、同一priority内の経路順を通常・対角競合優先・対角競合後回しに分ける。上記多様化版に対して`mean_log10=5.176591→5.177198`、幾何平均+0.140%、8勝1敗1分だった。経路候補数を4から8へ増やすと`5.175524`（-0.385%）まで悪化したため、候補数4とbeam幅10を維持する。
 - 3本のボーナス幹線と10本の犠牲経路を一括解放・復元するtransactional LNSは実際に発火し、`k=91→93, score_delta=+137901`、`k=75維持, +88650`、`k=93維持, +1023`を確認した。一方、350ms版は幾何平均-0.279%、250ms版は-0.310%。Nが大きくB≥4だけへ限定するとseed 8は最終約+0.98%だったが、seed 1〜10全体は-0.088%で、compact SA時間を奪う損失を回収できなかった。提出版は従来の2幹線+4犠牲・150msへ戻す。将来はcompactと時間を分け合う単発処理ではなく、複数のtransaction候補をcheap rankで作って完成候補だけ正確評価する必要がある。
+
+### rollback DSUによる6択厳密CSP
+
+- 各タイル辺をport頂点、隣接辺を恒久union、向き決定を3本のrollback unionとして実装した。DSU rootは出口0〜2個を保持し、異なるpairの出口2個または出口3個以上を即時棄却する。未確定タイルは有効向き数MRV、1候補は強制分岐、同数なら出口成分の前線・円周cut需要・境界深さで順序付けする。回転数は確定コストと各domain最小回転の下界でbranch-and-boundする。
+- 最適化ビルドでは`debug_assert!(union(...))`内の副作用が消えるため、恒久辺unionは必ず通常文で実行する。修正後はDSU接続数と完全評価が一致した。
+- seed 1（N=3）の無固定CSPは4ms・2637ノードで全15pair接続を完走し、最小14回転を証明した。構築scoreは既存beamの221から435へ上がったが、最終best 520は更新しなかった。seed 4（N=6）は約259ms・159510ノードで全33pairの初解を得たが、score 16797で既存構築より低かった。
+- 先に探索したボーナス幹線をstrand-domainとして固定する8候補は、seed 1では全て即時不充足だった。既存beamの高価値幹線だけを保持して未全接続を修復する版では、seed 8（N=16,B=8）が固定610・未確定111まで縮んだ。3秒診断は1/2/3幹線保持でそれぞれ55.8万/58.7万/72.5万ノードを探索したが初解0。出口数違反だけでは内部の不可能性検出が遅く、cut容量または未確定domainを通した相方出口到達可能性の伝播が必要。
+- 300ms有効版のseed 1〜10は`mean_log10=5.175214`（基準`5.177198`、幾何平均-0.456%）。高価値幹線1本保持で未全接続時だけ起動する版も`5.175205`（-0.458%）で、修復採用0。提出版では`ENABLE_EXACT_CSP_CONSTRUCTION=false`とし、実装を診断用に残す。
+
+### Construction ordering by circular crossings and route scarcity
+
+- Keeping hex distance as the primary key, two construction variants used the number of circularly alternating endpoint pairs as the within-distance secondary key, once descending and once ascending. Seeds 1--10 scored `mean_log10=5.176010` versus `5.177198` for the retained order, a geometric change of `-0.273%` with 3 wins, 5 losses, and 2 ties. Static boundary crossing count is therefore not a useful replacement for the current diagonal-contention diversity.
+- A domain-aware static scarcity audit examined up to eight pairs per equal-distance bucket after direct two-exit domains were initialized. It requested at most two routes per pair and sorted lower candidate counts first, retaining circular crossing order as the tie-break. Candidate counts did distinguish routes and reordered pairs on medium and large boards, but seeds 1--10 fell to `mean_log10=5.173375`, `-0.876%` geometrically, with 4 wins, 5 losses, and 1 tie. Initial-state route counts do not predict scarcity after earlier routes are fixed.
+- The fully dynamic version recomputed those capped route counts independently for every live tree-beam state, tracked a state-specific processed-pair mask, and spent at most 60 ms per construction pass. It genuinely reordered the frontier on larger boards, but seeds 1--10 scored `mean_log10=5.174448`, `-0.631%` geometrically, with 2 wins, 7 losses, and 1 tie. Candidate count alone is too coarse: a pair with one currently available shortest route is not necessarily the pair whose commitment best preserves the joint feasible set. Remove both scarcity variants; a future dynamic ordering metric should estimate the reduction in other pairs' domains/reachability for each candidate route, not just count the selected pair's routes.
+
+### compact SA温度の再調整
+
+- 区間短絡近傍を統合した現行版で、seed 1〜10を`2e6→100`（基準）、`1e6→100`、`3e6→100`、`4e6→100`、`2e6→1000`で比較した。`mean_log10`は順に`5.176269`, `5.175114`, `5.175891`, `5.175999`, `5.175017`。低い開始温度と高い終了温度はそれぞれ幾何平均`-0.266%`, `-0.288%`で明確に悪化した。
+- `4e6→100`は基準比`-0.062%`ながら6勝2敗2分だったため、100セル未満を2e6、それ以上を4e6とする規模別温度も実測した。しかし`mean_log10=5.173851`、基準比`-0.555%`（3勝5敗2分）で再現しなかった。後段の時間制SAを含む小差は安定しないため、既往実験とも一致して最も高い`2e6→100`を維持する。
+
+### 最新版100ケース再確認
+
+- 現行`2e6→100`版はseed 1〜100で失敗0、`mean_log10=5.189827`。直近の`latest100_connectivity=5.190006`および`unified_latest100=5.190008`に対して幾何平均`-0.041%`で、paired勝敗はそれぞれ43勝46敗11分、53勝41敗6分。bootstrap 95%区間も約`-0.92%〜+0.69%`で、全体として有意な悪化はない。
+- 差はseed 98の回帰に集中する。直近`709264`・過去最高`712077`に対し現行100ケースrunは`524790`、単独再実行3回も`522288/544800/579445`で回復しなかった。seed 98を除く99ケースは直近版より幾何平均`+0.263%`。旧ログではconstruction/finalとも`k=97`だったが、現行再実行はfinal `k=85`であり、温度ではなくmax-k construction多様化後の特定大盤面回帰と判断する。旧順序を第4構築系統またはseed 98型のfallbackとして残す価値がある。
