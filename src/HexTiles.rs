@@ -57,6 +57,7 @@ const CONNECT_REPAIR_TARGETS: usize = 10;
 const NONBONUS_SHORTEN_INTERVAL_MS: u64 = 600;
 const NONBONUS_SHORTEN_BUDGET_MS: u64 = 4;
 const NONBONUS_SHORTEN_TOP_TARGETS: usize = 4;
+const ADJACENT_SHORTCUT_MAX_MULTIPLIER: i64 = 1;
 const TRIANGLE_SHORTCUT_INTERVAL_MS: u64 = 500;
 const MULTITILE_CHOICE_LIMIT: usize = 24;
 const COMPACT_REPRESENTATIVES: usize = 1;
@@ -3741,10 +3742,12 @@ fn adjacent_shortcut_candidate(
         let old_value = differential.contribution[id];
         if old_length < 3
             || old_value <= 0
-            || !(1..=2).contains(&(old_value / old_length as i64))
+            || !(1..=ADJACENT_SHORTCUT_MAX_MULTIPLIER)
+                .contains(&(old_value / old_length as i64))
         {
             continue;
         }
+        let old_multiplier = (old_value / old_length as i64) as usize;
         let Some(states) = retrace_pair_states(board, orientation, id) else {
             continue;
         };
@@ -3791,7 +3794,7 @@ fn adjacent_shortcut_candidate(
                             if target == target_exit
                                 && new_length < old_length
                                 && new_value > 0
-                                && new_value / new_length == 2
+                                && new_value / new_length == old_multiplier
                                 && preserves_other_nonbonus_exit_paths(
                                     board,
                                     orientation,
@@ -3800,6 +3803,10 @@ fn adjacent_shortcut_candidate(
                                     scratch,
                                 )
                             {
+                                eprintln!(
+                                    "shortcut_candidate kind=adjacent_shortcut multiplier={} length={}->{}",
+                                    old_multiplier, old_length, new_length
+                                );
                                 return Some(NonbonusShortenCandidate {
                                     pair_id: Some(id),
                                     source_exit,
@@ -3934,7 +3941,10 @@ fn nonbonus_shorten_candidate(
         (Reverse(j - i + 1 - 3), Reverse(j - i + 1))
     });
     let mut distance2_work = orientation.to_vec();
-    for (i, j, middle, a_to_mid, mid_to_b) in distance2_segments.into_iter().take(32) {
+    for (i, j, middle, a_to_mid, mid_to_b) in distance2_segments
+        .into_iter()
+        .take(32)
+    {
         if Instant::now() >= deadline {
             break;
         }
@@ -6912,8 +6922,6 @@ fn collect_triangles(board: &Board) -> Vec<[usize; 3]> {
     triangles.dedup();
     triangles
 }
-
-
 
 fn improve_by_boundary_signatures(board: &Board, orientation: &mut Vec<u8>, deadline: Instant) {
     let table_deadline = (Instant::now() + Duration::from_millis(100)).min(deadline);

@@ -697,6 +697,13 @@ Despite the smooth definition, the auxiliary did not improve final score.  At 9.
 - Extending the one-cycle boundary to `valid_count >= 631` was tested on fixed `N=15`, random `B=1..10,M=1..5`, seeds 1--10. One cycle scored `mean_log10=5.771930` versus `5.771903` for three cycles, only `+0.006%` geometrically (4 wins, 5 losses, 1 tie), so the change is effectively neutral.
 - Keep the 721-cell boundary. The earlier extension to 469 cells was harmful, and N=15 provides no evidence strong enough to broaden the single-cycle range.
 
+### Adjacent shortcut multiplier comparison
+
+- In three paired seed 1--10 runs, adjacent shortcuts restricted to multiplier 1 averaged `mean_log10=5.175149695`; allowing multipliers 1 and 2 averaged `5.175215041`. Thus the multiplier-2 addition was `+0.000065346` in log10, about `+0.015%` geometrically, not a negative change.
+- The multiplier-2 branch generated 113 candidates and was accepted once. Because the gain was small, candidate volume increased, and the final decision will be made against the 5,000-case evaluation, retain multiplier 1 only for simplicity and stable time allocation. This is an adoption-cost decision, not a claim that multiplier 2 worsened the three-run mean.
+
+- Three-run seed 1--10 averages for the retained local-transfer components were `5.175150` with all components, `5.174785` without adjacent shortcuts (`-0.084%` geometrically), `5.175108` without distance-two shortcuts (`-0.010%`), `5.172667` without triangle shortcuts (`-0.570%`), and `5.175119` without detached-loop merging (`-0.007%`). Keep all four enabled; triangle and adjacent shortcuts are clearly useful, while distance-two and loop merging are small but consistently nonnegative contributions in this comparison.
+
 ### compact SA温度の再調整
 
 - 区間短絡近傍を統合した現行版で、seed 1〜10を`2e6→100`（基準）、`1e6→100`、`3e6→100`、`4e6→100`、`2e6→1000`で比較した。`mean_log10`は順に`5.176269`, `5.175114`, `5.175891`, `5.175999`, `5.175017`。低い開始温度と高い終了温度はそれぞれ幾何平均`-0.266%`, `-0.288%`で明確に悪化した。
