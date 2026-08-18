@@ -57,6 +57,7 @@ const CONNECT_REPAIR_TARGETS: usize = 10;
 const NONBONUS_SHORTEN_INTERVAL_MS: u64 = 600;
 const NONBONUS_SHORTEN_BUDGET_MS: u64 = 4;
 const NONBONUS_SHORTEN_TOP_TARGETS: usize = 4;
+const TRIANGLE_SHORTCUT_INTERVAL_MS: u64 = 500;
 const MULTITILE_CHOICE_LIMIT: usize = 24;
 const COMPACT_REPRESENTATIVES: usize = 1;
 const COMPACT_SA_START_TEMP: f64 = 2_000_000.0;
@@ -203,6 +204,7 @@ struct MultiTileChoice {
     cells: [usize; 3],
     variants: [[u8; 3]; 2],
     target_pair: [usize; 2],
+    triangle: Option<(usize, usize, usize, usize, i64)>,
 }
 
 struct DifferentialEval {
@@ -313,6 +315,7 @@ struct Board {
     pair_id_by_exit: Vec<usize>,
     transition: Vec<u16>,
     neighbors: Vec<[usize; 6]>,
+    rotation_costs: Vec<[i32; 6]>,
     domain_rotation: Vec<[i32; 64]>,
     boundary_depth: Vec<usize>,
     valid_cells: Vec<usize>,
@@ -806,12 +809,11 @@ impl Board {
                 scratch.touched.push(state);
                 step += 1;
                 let cell = state / 6;
-                let enter = state % 6;
-                let out = paired_dir(orientation[cell], enter);
-                let Some((next, next_enter)) = self.next(cell, out) else {
+                let next = self.transition[state * 6 + orientation[cell] as usize] as usize;
+                if next >= ports {
                     break;
-                };
-                state = next * 6 + next_enter;
+                }
+                state = next;
             }
             for &state in &scratch.touched {
                 scratch.globally_seen[state] = epoch;
@@ -2212,7 +2214,7 @@ impl OptimisticReachabilityScratch {
         }
     }
 
-    fn reachable_pairs_into(&mut self, board: &Board, fixed: &[u8], reachable: &mut Vec<bool>) {
+    fn reachable_pairs(&mut self, board: &Board, fixed: &[u8]) -> u128 {
         for (component, parent) in self.parent.iter_mut().enumerate() {
             *parent = component;
         }
@@ -2228,12 +2230,13 @@ impl OptimisticReachabilityScratch {
                 }
             }
         }
-        reachable.clear();
-        for pair in &board.pairs {
+        let mut reachable = 0u128;
+        for (id, pair) in board.pairs.iter().enumerate() {
             let connected = self.root(self.exit_component[pair[0]])
                 == self.root(self.exit_component[pair[1]]);
-            reachable.push(connected);
+            reachable |= u128::from(connected) << id;
         }
+        reachable
     }
 }
 
@@ -2701,8 +2704,7 @@ fn run_tree_board_beam(
     let started = Instant::now();
     let search_deadline = started + Duration::from_millis(COMPLETE_TREE_BOARD_BEAM_SAFETY_MS);
     let mut optimistic_scratch = OptimisticReachabilityScratch::new(board);
-    let mut reachable = Vec::with_capacity(board.pairs.len());
-    optimistic_scratch.reachable_pairs_into(board, &fixed, &mut reachable);
+    let reachable = optimistic_scratch.reachable_pairs(board, &fixed);
     let rotated_tile_count = board
         .valid_cells
         .iter()
@@ -2729,7 +2731,7 @@ fn run_tree_board_beam(
     let mut beam = vec![TreeBoardCandidate {
         node: 0,
         connected_count: state.connected.iter().filter(|&&value| value).count(),
-        optimistic_count: reachable.iter().filter(|&&value| value).count(),
+        optimistic_count: reachable.count_ones() as usize,
         route_length: 0,
         rotated_tile_count: state.rotated_tile_count,
         rotation_lower_bound: state.rotation_lower_bound,
@@ -2749,10 +2751,10 @@ fn run_tree_board_beam(
     let mut reachability_calls = 1usize;
     let mut expanded = 0usize;
     let mut reverse_scratch = ReverseBfsScratch::new(board.valid.len() * 6);
-    let mut forced_dsu_scratch = Some(ForcedPortDsu::new(board));
+    let mut forced_dsu_scratch = ForcedPortDsu::new(board);
     let mut csp_propagation_scratch = TreeCspPropagationScratch::new(board.valid.len());
-    let mut before_reachable = Vec::with_capacity(board.pairs.len());
-    let mut after_reachable = Vec::with_capacity(board.pairs.len());
+    let mut before_reachable: u128;
+    let mut after_reachable: u128;
     let mut archive_updates = 0usize;
     let mut csp_stats = TreeCspStats::default();
 
@@ -2799,17 +2801,11 @@ fn run_tree_board_beam(
                     .into_iter()
                     .filter(|route| route.length == shortest)
                     .collect();
-                if let Some(dsu) = forced_dsu_scratch.as_mut() {
-                    dsu.rollback(0);
-                    if !dsu.add_all_domains(board, &state.fixed) {
-                        continue;
-                    }
+                forced_dsu_scratch.rollback(0);
+                if !forced_dsu_scratch.add_all_domains(board, &state.fixed) {
+                    continue;
                 }
-                optimistic_scratch.reachable_pairs_into(
-                    board,
-                    &state.fixed,
-                    &mut before_reachable,
-                );
+                before_reachable = optimistic_scratch.reachable_pairs(board, &state.fixed);
                 reachability_calls += 1;
                 let mut accepted_shortest = false;
                 let mut loaded_detours = false;
@@ -2856,55 +2852,45 @@ fn run_tree_board_beam(
                         nodes[candidate.node].depth,
                     );
                     tree_board_apply_node(board, &mut state, &node);
-                    let dsu_snapshot = forced_dsu_scratch
-                        .as_ref()
-                        .map_or(0, ForcedPortDsu::snapshot);
+                    let dsu_snapshot = forced_dsu_scratch.snapshot();
                     let mut csp_ok = true;
-                    if let Some(dsu) = forced_dsu_scratch.as_mut() {
-                        csp_stats.tested_routes += 1;
-                        for change in &node.changes {
-                            if !dsu.add_forced_domain(board, change.cell, change.new_domain) {
-                                csp_ok = false;
-                                break;
-                            }
+                    csp_stats.tested_routes += 1;
+                    for change in &node.changes {
+                        if !forced_dsu_scratch
+                            .add_forced_domain(board, change.cell, change.new_domain)
+                        {
+                            csp_ok = false;
+                            break;
                         }
-                        if csp_ok {
-                            csp_ok = tree_csp_propagate(
-                                board,
-                                &mut state,
-                                &mut node,
-                                dsu,
-                                &mut csp_propagation_scratch,
-                                &mut csp_stats,
-                            );
-                        }
+                    }
+                    if csp_ok {
+                        csp_ok = tree_csp_propagate(
+                            board,
+                            &mut state,
+                            &mut node,
+                            &mut forced_dsu_scratch,
+                            &mut csp_propagation_scratch,
+                            &mut csp_stats,
+                        );
                     }
                     if !csp_ok {
                         csp_stats.rejected_routes += 1;
                         tree_board_revert_node(board, &mut state, &node);
-                        if let Some(dsu) = forced_dsu_scratch.as_mut() {
-                            dsu.rollback(dsu_snapshot);
-                        }
+                        forced_dsu_scratch.rollback(dsu_snapshot);
                         continue;
                     }
-                    optimistic_scratch.reachable_pairs_into(
-                        board,
-                        &state.fixed,
-                        &mut after_reachable,
-                    );
+                    after_reachable = optimistic_scratch.reachable_pairs(board, &state.fixed);
                     reachability_calls += 1;
                     let keeps_future_open = (0..board.pairs.len()).all(|other| {
                         state.connected[other]
                             || other == id
-                            || !before_reachable[other]
-                            || after_reachable[other]
+                            || before_reachable >> other & 1 == 0
+                            || after_reachable >> other & 1 != 0
                     });
                     let child_rotated_tile_count = state.rotated_tile_count;
                     let child_rotation_lower_bound = state.rotation_lower_bound;
                     tree_board_revert_node(board, &mut state, &node);
-                    if let Some(dsu) = forced_dsu_scratch.as_mut() {
-                        dsu.rollback(dsu_snapshot);
-                    }
+                    forced_dsu_scratch.rollback(dsu_snapshot);
                     if keeps_future_open {
                         accepted_shortest |= route.length == shortest;
                         csp_stats.detour_accepted += usize::from(route.length > shortest);
@@ -2915,10 +2901,7 @@ fn run_tree_board_beam(
                         next_beam.push(TreeBoardCandidate {
                             node: next_node,
                             connected_count: candidate.connected_count + 1,
-                            optimistic_count: after_reachable
-                                .iter()
-                                .filter(|&&value| value)
-                                .count(),
+                            optimistic_count: after_reachable.count_ones() as usize,
                             route_length: candidate.route_length + route.length,
                             rotated_tile_count: child_rotated_tile_count,
                             rotation_lower_bound: child_rotation_lower_bound,
@@ -3037,7 +3020,8 @@ fn run_tree_board_beam(
     eprintln!(
         "tree_board_beam nodes={} expanded={} reachability={} csp_tested={} csp_rejected={} csp_domain_changes={} csp_removed={} csp_checks={} csp_limits={} route_detours={}/{} archive={}/{} tracked_k={} exact_k={} exact_score={} projected_score={} projected_t={} projected_m={} used={} shortest={} detour={} free={} bonuses={} avg_multiplier_milli={} segments={} rotated={} rotation_lb={} elapsed_ms={}",
         nodes.len(), expanded, reachability_calls,
-        csp_stats.tested_routes, csp_stats.rejected_routes, csp_stats.domain_changes,
+        csp_stats.tested_routes, csp_stats.rejected_routes,
+        csp_stats.domain_changes,
         csp_stats.removed_orientations, csp_stats.checks, csp_stats.check_limit_hits,
         csp_stats.detour_accepted, csp_stats.detour_tested,
         archive_updates, archive.len(),
@@ -3657,7 +3641,70 @@ struct NonbonusShortenCandidate {
     target_exit: usize,
     old_length: usize,
     new_length: usize,
+    kind: &'static str,
     work: Vec<u8>,
+}
+
+fn log_shortcut_metrics(
+    board: &Board,
+    kind: &str,
+    before_orientation: &[u8],
+    after_orientation: &[u8],
+    before: Stats,
+    after: Stats,
+    before_diff: &DifferentialEval,
+    after_diff: &DifferentialEval,
+    victim_id: Option<usize>,
+    old_length: usize,
+    new_length: usize,
+) {
+    let victim_multiplier = victim_id
+        .and_then(|id| {
+            let length = before_diff.pair_cells[id].len();
+            (length > 0).then_some(before_diff.contribution[id] / length as i64)
+        })
+        .unwrap_or(-1);
+    let mut hero = None;
+    for id in 0..board.pairs.len() {
+        if victim_id == Some(id) || after_diff.contribution[id] <= before_diff.contribution[id] {
+            continue;
+        }
+        let length = after_diff.pair_cells[id].len();
+        if length == 0 {
+            continue;
+        }
+        let gain = after_diff.contribution[id] - before_diff.contribution[id];
+        let multiplier = after_diff.contribution[id] / length as i64;
+        if hero.map_or(true, |(_, best_gain, _)| gain > best_gain) {
+            hero = Some((id, gain, multiplier));
+        }
+    }
+    let mut changed_tiles = 0usize;
+    let mut affected = 0u128;
+    for &cell in &board.valid_cells {
+        if before_orientation[cell] != after_orientation[cell] {
+            changed_tiles += 1;
+            affected |= before_diff.cell_masks[cell] | after_diff.cell_masks[cell];
+        }
+    }
+    if let Some(id) = victim_id {
+        affected |= 1u128 << id;
+    }
+    eprintln!(
+        "shortcut_accept kind={} victim_id={:?} length={}->{} victim_multiplier={} hero_id={} hero_multiplier={} hero_gain={} delta_t={} delta_moves={} affected_pairs={} changed_tiles={}",
+        kind,
+        victim_id,
+        old_length,
+        new_length,
+        victim_multiplier,
+        hero.map_or(-1, |x| x.0 as i64),
+        hero.map_or(-1, |x| x.2),
+        hero.map_or(0, |x| x.1),
+        after.total - before.total,
+        after.moves - before.moves,
+        affected.count_ones(),
+        changed_tiles
+    );
 }
 
 fn preserves_other_nonbonus_exit_paths(
@@ -3682,6 +3729,98 @@ fn preserves_other_nonbonus_exit_paths(
     true
 }
 
+fn adjacent_shortcut_candidate(
+    board: &Board,
+    orientation: &[u8],
+    differential: &DifferentialEval,
+    scratch: &mut EvalScratch,
+    deadline: Instant,
+) -> Option<NonbonusShortenCandidate> {
+    for id in 0..board.pairs.len() {
+        let old_length = differential.pair_cells[id].len();
+        let old_value = differential.contribution[id];
+        if old_length < 3
+            || old_value <= 0
+            || !(1..=2).contains(&(old_value / old_length as i64))
+        {
+            continue;
+        }
+        let Some(states) = retrace_pair_states(board, orientation, id) else {
+            continue;
+        };
+        let (source_exit, target_exit) = (board.pairs[id][0], board.pairs[id][1]);
+        let mut positions = vec![Vec::new(); board.valid.len()];
+        for (pos, &(cell, _)) in states.iter().enumerate() {
+            positions[cell].push(pos);
+        }
+        let mut work = orientation.to_vec();
+        for (i, &(a, a_enter)) in states.iter().enumerate() {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            for side in 0..6 {
+                let Some((b, _)) = board.next(a, side) else {
+                    continue;
+                };
+                for &j in &positions[b] {
+                    if j < i + 2 {
+                        continue;
+                    }
+                    let (_, b_enter) = states[j];
+                    let b_from_a = (side + 3) % 6;
+                    let b_old_out = paired_dir(orientation[b], b_enter);
+                    let old_a = orientation[a];
+                    let old_b = orientation[b];
+                    for oa in 0..6u8 {
+                        if paired_dir(oa, a_enter) != side {
+                            continue;
+                        }
+                        for ob in 0..6u8 {
+                            if paired_dir(ob, b_from_a) != b_old_out {
+                                continue;
+                            }
+                            work[a] = oa;
+                            work[b] = ob;
+                            let (target, new_length, bonuses) =
+                                board.trace_with_scratch(&work, source_exit, scratch);
+                            let new_value = if new_length > 0 {
+                                new_length * (bonuses + 1)
+                            } else {
+                                0
+                            };
+                            if target == target_exit
+                                && new_length < old_length
+                                && new_value > 0
+                                && new_value / new_length == 2
+                                && preserves_other_nonbonus_exit_paths(
+                                    board,
+                                    orientation,
+                                    &work,
+                                    (source_exit, target_exit),
+                                    scratch,
+                                )
+                            {
+                                return Some(NonbonusShortenCandidate {
+                                    pair_id: Some(id),
+                                    source_exit,
+                                    target_exit,
+                                    old_length,
+                                    new_length: new_length as usize,
+                                    kind: "adjacent_shortcut",
+                                    work,
+                                });
+                            }
+                            work[a] = old_a;
+                            work[b] = old_b;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn nonbonus_shorten_candidate(
     board: &Board,
     orientation: &[u8],
@@ -3692,6 +3831,15 @@ fn nonbonus_shorten_candidate(
     rng: &mut Rng,
     deadline: Instant,
 ) -> Option<NonbonusShortenCandidate> {
+    if let Some(candidate) = adjacent_shortcut_candidate(
+        board,
+        orientation,
+        differential,
+        scratch,
+        deadline,
+    ) {
+        return Some(candidate);
+    }
     let mut targets = Vec::new();
     for id in 0..board.pairs.len() {
         let length = differential.pair_cells[id].len();
@@ -3751,6 +3899,97 @@ fn nonbonus_shorten_candidate(
         let (next, next_enter) = board.next(cell, out)?;
         cell = next;
         enter = next_enter;
+    }
+
+    // Enumerate distance-two endpoint pairs and their common middle cells.
+    // A three-tile connection can replace any old segment of four or more
+    // tiles without invoking the wider route search.
+    let mut positions = vec![Vec::new(); board.valid.len()];
+    for (pos, &(cell, _)) in states.iter().enumerate() {
+        positions[cell].push(pos);
+    }
+    let mut distance2_segments = Vec::new();
+    for i in 0..path_length.saturating_sub(3) {
+        let (a, _) = states[i];
+        for a_to_mid in 0..6 {
+            let Some((middle, _)) = board.next(a, a_to_mid) else {
+                continue;
+            };
+            for mid_to_b in 0..6 {
+                let Some((b, _)) = board.next(middle, mid_to_b) else {
+                    continue;
+                };
+                if b == a {
+                    continue;
+                }
+                for &j in &positions[b] {
+                    if j >= i + 3 {
+                        distance2_segments.push((i, j, middle, a_to_mid, mid_to_b));
+                    }
+                }
+            }
+        }
+    }
+    distance2_segments.sort_unstable_by_key(|&(i, j, _, _, _)| {
+        (Reverse(j - i + 1 - 3), Reverse(j - i + 1))
+    });
+    let mut distance2_work = orientation.to_vec();
+    for (i, j, middle, a_to_mid, mid_to_b) in distance2_segments.into_iter().take(32) {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let (a, a_enter) = states[i];
+        let (b, b_enter) = states[j];
+        let target_out = paired_dir(orientation[b], b_enter);
+        let old_a = orientation[a];
+        let old_middle = orientation[middle];
+        let old_b = orientation[b];
+        let middle_enter = (a_to_mid + 3) % 6;
+        let b_enter_from_middle = (mid_to_b + 3) % 6;
+        for oa in 0..6u8 {
+            if paired_dir(oa, a_enter) != a_to_mid {
+                continue;
+            }
+            for oc in 0..6u8 {
+                if paired_dir(oc, middle_enter) != mid_to_b {
+                    continue;
+                }
+                for ob in 0..6u8 {
+                    if paired_dir(ob, b_enter_from_middle) != target_out {
+                        continue;
+                    }
+                    distance2_work[a] = oa;
+                    distance2_work[middle] = oc;
+                    distance2_work[b] = ob;
+                    let (target, length, bonuses) =
+                        board.trace_with_scratch(&distance2_work, source_exit, scratch);
+                    if target == target_exit
+                        && length < path_length
+                        && bonuses == 0
+                        && preserves_other_nonbonus_exit_paths(
+                            board,
+                            orientation,
+                            &distance2_work,
+                            (source_exit, target_exit),
+                            scratch,
+                        )
+                    {
+                        return Some(NonbonusShortenCandidate {
+                            pair_id: target_pair_id,
+                            source_exit,
+                            target_exit,
+                            old_length: path_length,
+                            new_length: length,
+                            kind: "distance2",
+                            work: distance2_work,
+                        });
+                    }
+                    distance2_work[a] = old_a;
+                    distance2_work[middle] = old_middle;
+                    distance2_work[b] = old_b;
+                }
+            }
+        }
     }
 
     // Pick two points whose old subpath is longer than the geometric lower
@@ -3865,6 +4104,7 @@ fn nonbonus_shorten_candidate(
         target_exit,
         old_length: old_segment_length,
         new_length,
+        kind: "route",
         work,
     })
 }
@@ -4742,6 +4982,26 @@ fn multi_trunk_lns(board: &Board, orientation: &mut Vec<u8>, start: Instant, dea
 }
 
 
+fn retrace_pair_states(
+    board: &Board,
+    orientation: &[u8],
+    pair_id: usize,
+) -> Option<Vec<(usize, usize)>> {
+    let (cell, enter) = board.exits[board.pairs[pair_id][0]];
+    let terminal_base = board.valid.len() * 6;
+    let mut state = cell * 6 + enter;
+    let mut states = Vec::new();
+    for _ in 0..=3 * board.valid_count {
+        states.push((state / 6, state % 6));
+        let next = board.transition[state * 6 + orientation[state / 6] as usize] as usize;
+        if next >= terminal_base {
+            return Some(states);
+        }
+        state = next;
+    }
+    None
+}
+
 fn build_multitile_choices(board: &Board, orientation: &[u8]) -> Vec<MultiTileChoice> {
     let started = Instant::now();
     let mut scratch = EvalScratch::new(board.valid.len());
@@ -4753,7 +5013,10 @@ fn build_multitile_choices(board: &Board, orientation: &[u8]) -> Vec<MultiTileCh
     let mut direct_cells = Vec::new();
     let mut direct_pair_stats = Vec::new();
     let mut horizontal_pairs = 0usize;
-    let mut candidates: Vec<(i64, i64, MultiTileChoice)> = Vec::new();
+    let mut candidates: Vec<(i64, i64, i32, MultiTileChoice)> = Vec::new();
+    let mut triangle_motifs = 0usize;
+    let mut triangle_tested = 0usize;
+    let mut triangle_candidates = 0usize;
     for id in 0..board.pairs.len() {
         direct_cells.clear();
         let pair = board.pairs[id];
@@ -4821,10 +5084,12 @@ fn build_multitile_choices(board: &Board, orientation: &[u8]) -> Vec<MultiTileCh
                     candidates.push((
                         next.score - base.score,
                         other_gain,
+                        0,
                         MultiTileChoice {
                             cells,
                             variants: [current, local],
                             target_pair: pair,
+                            triangle: None,
                         },
                     ));
                 }
@@ -4834,11 +5099,156 @@ fn build_multitile_choices(board: &Board, orientation: &[u8]) -> Vec<MultiTileCh
             }
         }
     }
-    candidates.sort_unstable_by_key(|x| (Reverse(x.0), Reverse(x.1)));
+    // A low-bonus path can sometimes lose one corner tile while a higher-bonus
+    // path gains that tile.  Try those local triangle shortcuts after the
+    // existing direct-pair candidates have been generated.
+    for id in 0..board.pairs.len() {
+        let old_length = differential.pair_cells[id].len();
+        if old_length < 3 || differential.contribution[id] <= 0 {
+            continue;
+        }
+        let multiplier = differential.contribution[id] / old_length as i64;
+        if multiplier > 2 {
+            continue;
+        }
+        let Some(states) = retrace_pair_states(board, orientation, id) else {
+            continue;
+        };
+        if states.len() != old_length {
+            continue;
+        }
+        for window in states.windows(3) {
+            let (a, a_enter) = window[0];
+            let (c, c_enter) = window[1];
+            let (b, b_enter) = window[2];
+            if a == c || a == b || c == b || board.bonus[c] {
+                continue;
+            }
+            let c_out = paired_dir(orientation[c], c_enter);
+            let adjacent_ports = (c_out + 1) % 6 == c_enter || (c_enter + 1) % 6 == c_out;
+            if !adjacent_ports {
+                continue;
+            }
+            let Some(a_to_b) = (0..6).find(|&side| board.next(a, side).is_some_and(|x| x.0 == b))
+            else {
+                continue;
+            };
+            triangle_motifs += 1;
+            let b_from_a = (a_to_b + 3) % 6;
+            let b_old_out = paired_dir(orientation[b], b_enter);
+            let old_local = [orientation[a], orientation[c], orientation[b]];
+            let current_local_moves = rotation_cost(board.initial[a], old_local[0])
+                + rotation_cost(board.initial[c], old_local[1])
+                + rotation_cost(board.initial[b], old_local[2]);
+            let affected = differential.cell_masks[a]
+                | differential.cell_masks[c]
+                | differential.cell_masks[b]
+                | (1u128 << id);
+            let mut oa_values = Vec::new();
+            let mut ob_values = Vec::new();
+            for oa in 0..6u8 {
+                if paired_dir(oa, a_enter) == a_to_b {
+                    oa_values.push(oa);
+                }
+            }
+            for ob in 0..6u8 {
+                if paired_dir(ob, b_from_a) == b_old_out {
+                    ob_values.push(ob);
+                }
+            }
+            for &oa in &oa_values {
+                for &ob in &ob_values {
+                    for oc in 0..6u8 {
+                        triangle_tested += 1;
+                        let local = [oa, oc, ob];
+                        work[a] = local[0];
+                        work[c] = local[1];
+                        work[b] = local[2];
+                        let (new_value, new_length) = board.trace_pair(&work, id, &mut scratch, None);
+                        let new_multiplier = if new_length > 0 {
+                            new_value / new_length as i64
+                        } else {
+                            0
+                        };
+                        if new_length != (old_length - 1) as i64
+                            || new_value <= 0
+                            || new_multiplier != multiplier
+                        {
+                            work[a] = old_local[0];
+                            work[c] = old_local[1];
+                            work[b] = old_local[2];
+                            continue;
+                        }
+                        let local_moves = rotation_cost(board.initial[a], local[0])
+                            + rotation_cost(board.initial[c], local[1])
+                            + rotation_cost(board.initial[b], local[2]);
+                        let next = differential.proposal(
+                            board,
+                            &work,
+                            base,
+                            base.moves - current_local_moves + local_moves,
+                            affected,
+                            &mut scratch,
+                            &mut updates,
+                        );
+                        let no_cut = updates.iter().all(|&(other, value)| {
+                            other == id || differential.contribution[other] <= 0 || value > 0
+                        });
+                        let mut hero = None;
+                        for &(other, value) in &updates {
+                            let old_other_length = differential.pair_cells[other].len();
+                            let old_other = differential.contribution[other];
+                            if other != id
+                                && old_other_length > 0
+                                && old_other > 0
+                                && old_other / old_other_length as i64 > multiplier
+                                && value > old_other
+                            {
+                                let gain = value - old_other;
+                                if hero.map_or(true, |(_, best_gain)| gain > best_gain) {
+                                    hero = Some((other, gain));
+                                }
+                            }
+                        }
+                        let safe = no_cut
+                            && next.matched >= base.matched
+                            && next.score > base.score
+                            && hero.is_some()
+                            && board.tester_safe(&work);
+                        if safe {
+                            let (hero_id, hero_gain) = hero.unwrap();
+                            triangle_candidates += 1;
+                            candidates.push((
+                                next.score - base.score,
+                                hero_gain,
+                                local_moves - current_local_moves,
+                                MultiTileChoice {
+                                    cells: [a, c, b],
+                                    variants: [old_local, local],
+                                    target_pair: board.pairs[id],
+                                    triangle: Some((
+                                        id,
+                                        old_length,
+                                        new_length as usize,
+                                        hero_id,
+                                        hero_gain,
+                                    )),
+                                },
+                            ));
+                        }
+                        work[a] = old_local[0];
+                        work[c] = old_local[1];
+                        work[b] = old_local[2];
+                    }
+                }
+            }
+        }
+    }
+    candidates.sort_unstable_by_key(|x| (Reverse(x.0), Reverse(x.1), x.2));
     let raw = candidates.len();
     let mut used = vec![false; board.valid.len()];
     let mut choices = Vec::new();
-    for (_, _, choice) in candidates {
+    for (_, _, _, choice) in candidates {
         if choice.cells.iter().any(|&cell| used[cell]) {
             continue;
         }
@@ -4851,11 +5261,14 @@ fn build_multitile_choices(board: &Board, orientation: &[u8]) -> Vec<MultiTileCh
         }
     }
     eprintln!(
-        "multitile_choices horizontal_pairs={} long_direct_pairs={:?} raw={} disjoint={} elapsed_ms={}",
+        "multitile_choices horizontal_pairs={} long_direct_pairs={:?} raw={} disjoint={} triangle_shortcut motifs={} tested={} candidates={} elapsed_ms={}",
         horizontal_pairs,
         direct_pair_stats,
         raw,
         choices.len(),
+        triangle_motifs,
+        triangle_tested,
+        triangle_candidates,
         started.elapsed().as_millis()
     );
     choices
@@ -4868,9 +5281,11 @@ fn resolve_multitile_choices(
 ) {
     let mut scratch = EvalScratch::new(board.valid.len());
     let mut stats = board.evaluate_with_scratch(orientation, &mut scratch);
+    let mut differential = DifferentialEval::new(board, orientation, &mut scratch);
     let initial = stats;
     let mut tested = 0usize;
     let mut accepted = 0usize;
+    let mut triangle_accepted = 0usize;
     let mut accepted_pairs = Vec::new();
     for choice in choices {
         let current = [
@@ -4902,23 +5317,50 @@ fn resolve_multitile_choices(
             }
         }
         if let Some((next, variant)) = best {
+            let before_stats = stats;
+            let score_delta = next.score - before_stats.score;
+            let triangle = choice.triangle;
+            let before_orientation = triangle.is_some().then(|| orientation.clone());
             for (i, &cell) in choice.cells.iter().enumerate() {
                 orientation[cell] = variant[i];
             }
             stats = next;
             accepted += 1;
             accepted_pairs.push(choice.target_pair);
+            if let Some((victim_id, old_length, new_length, hero_id, hero_gain)) = triangle {
+                triangle_accepted += 1;
+                let next_differential = DifferentialEval::new(board, orientation, &mut scratch);
+                log_shortcut_metrics(
+                    board,
+                    "triangle",
+                    before_orientation.as_ref().unwrap(),
+                    orientation,
+                    before_stats,
+                    next,
+                    &differential,
+                    &next_differential,
+                    Some(victim_id),
+                    old_length,
+                    new_length,
+                );
+                differential = next_differential;
+                eprintln!(
+                    "triangle_shortcut accepted victim_id={} {}->{} hero_id={} hero_gain={} score_delta={}",
+                    victim_id, old_length, new_length, hero_id, hero_gain, score_delta
+                );
+            }
         }
     }
     eprintln!(
-        "multitile_resolve choices={} tested={} accepted={} accepted_pairs={:?} k={}->{} score_delta={}",
+        "multitile_resolve choices={} tested={} accepted={} accepted_pairs={:?} k={}->{} score_delta={} triangle_shortcut accepted={}",
         choices.len(),
         tested,
         accepted,
         accepted_pairs,
         initial.matched,
         stats.matched,
-        stats.score - initial.score
+        stats.score - initial.score,
+        triangle_accepted
     );
 }
 
@@ -5312,6 +5754,7 @@ fn search_rotations(
     let mut next_repair = start + Duration::from_secs_f64(0.65 * span);
     let mut next_connect = start + Duration::from_secs_f64(0.55 * span);
     let mut next_nonbonus_shorten = start + Duration::from_secs_f64(0.35 * span);
+    let mut next_triangle_shortcut = start + Duration::from_millis(TRIANGLE_SHORTCUT_INTERVAL_MS);
     let mut now = Instant::now();
     let mut temperature = start_temperature;
     let temperature_cycles = if board.valid_count >= SINGLE_CYCLE_MIN_CELLS {
@@ -5372,6 +5815,7 @@ fn search_rotations(
                     target_exit,
                     old_length,
                     new_length,
+                    kind,
                     work: mut candidate,
                 } = shorten;
                 nonbonus_shorten_completed += 1;
@@ -5393,6 +5837,19 @@ fn search_rotations(
                     && can_save(next.matched)
                     && board.tester_safe_with_scratch(&candidate, &mut safety_scratch)
                 {
+                    log_shortcut_metrics(
+                        board,
+                        kind,
+                        &current,
+                        &candidate,
+                        current_stats,
+                        next,
+                        &differential,
+                        &next_differential,
+                        target_pair_id,
+                        old_length,
+                        new_length,
+                    );
                     current = candidate;
                     current_stats = next;
                     differential = next_differential;
@@ -5401,8 +5858,8 @@ fn search_rotations(
                     nonbonus_shorten_direct_accepts += 1;
                     nonbonus_shorten_wrong_accepts += usize::from(target_pair_id.is_none());
                     eprintln!(
-                        "nonbonus_shorten_accept pair={:?} exits={}->{} length={}->{} score={} merged=false",
-                        target_pair_id, source_exit, target_exit, old_length, new_length, next.score
+                        "nonbonus_shorten_accept kind={} pair={:?} exits={}->{} length={}->{} score={} merged=false",
+                        kind, target_pair_id, source_exit, target_exit, old_length, new_length, next.score
                     );
                 } else {
                     updates.clear();
@@ -5479,6 +5936,19 @@ fn search_rotations(
                             let target_still_preserved =
                                 board.trace_end(&candidate, source_exit) == target_exit;
                             if still_preserves_nonbonus && target_still_preserved {
+                                log_shortcut_metrics(
+                                    board,
+                                    kind,
+                                    &current,
+                                    &candidate,
+                                    current_stats,
+                                    merged.stats,
+                                    &differential,
+                                    &merged_differential,
+                                    target_pair_id,
+                                    old_length,
+                                    new_length,
+                                );
                                 current = candidate;
                                 current_stats = merged.stats;
                                 differential = merged_differential;
@@ -5490,7 +5960,8 @@ fn search_rotations(
                                 loop_merge_accepts += 1;
                                 loop_merge_added_length += merged.loop_length;
                                 eprintln!(
-                                    "nonbonus_shorten_accept pair={:?} exits={}->{} length={}->{} score={} merged=true loop_length={} target_pair={}",
+                                    "nonbonus_shorten_accept kind={} pair={:?} exits={}->{} length={}->{} score={} merged=true loop_length={} target_pair={}",
+                                    kind,
                                     target_pair_id,
                                     source_exit,
                                     target_exit,
@@ -5639,6 +6110,33 @@ fn search_rotations(
             iterations += 1;
             continue;
         }
+        if now >= next_triangle_shortcut {
+            next_triangle_shortcut += Duration::from_millis(TRIANGLE_SHORTCUT_INTERVAL_MS);
+            let choices = build_multitile_choices(board, &current);
+            let triangle_choices: Vec<MultiTileChoice> = choices
+                .into_iter()
+                .filter(|choice| choice.triangle.is_some())
+                .collect();
+            if !triangle_choices.is_empty() {
+                let before = current_stats;
+                resolve_multitile_choices(board, &mut current, &triangle_choices);
+                let next = board.evaluate_with_scratch(&current, &mut eval_scratch);
+                if next.score != before.score || next.matched != before.matched {
+                    current_stats = next;
+                    differential = DifferentialEval::new(board, &current, &mut eval_scratch);
+                    if can_save(next.matched)
+                        && next.quality() > best_stats.quality()
+                        && board.tester_safe_with_scratch(&current, &mut safety_scratch)
+                    {
+                        best_stats = next;
+                        best.clone_from(&current);
+                    }
+                }
+            }
+            now = Instant::now();
+            iterations += 1;
+            continue;
+        }
         random_attempts += 1;
         let changes = 1 + rng.usize(if cells.len() < 80 { 4 } else { 3 });
         undo.clear();
@@ -5675,8 +6173,8 @@ fn search_rotations(
             + undo
                 .iter()
                 .map(|&(cell, old)| {
-                    rotation_cost(board.initial[cell], current[cell])
-                        - rotation_cost(board.initial[cell], old)
+                    board.rotation_costs[cell][current[cell] as usize]
+                        - board.rotation_costs[cell][old as usize]
                 })
                 .sum::<i32>();
         differential_pairs += affected.count_ones() as usize;
@@ -7283,6 +7781,12 @@ fn main() {
         }
     }
     let valid_cells: Vec<usize> = (0..valid.len()).filter(|&cell| valid[cell]).collect();
+    let mut rotation_costs = vec![[0; 6]; valid.len()];
+    for &cell in &valid_cells {
+        for o in 0..6u8 {
+            rotation_costs[cell][o as usize] = rotation_cost(initial[cell], o);
+        }
+    }
     let mut domain_rotation = vec![[i32::MAX; 64]; valid.len()];
     for &cell in &valid_cells {
         for domain in 1usize..64 {
@@ -7314,6 +7818,7 @@ fn main() {
         pair_id_by_exit,
         transition,
         neighbors,
+        rotation_costs,
         domain_rotation,
         boundary_depth,
         valid_cells,
@@ -7410,8 +7915,6 @@ fn main() {
         emit_phase_snapshot(&board, "05_rotation_sa", &best_orientation);
         let postprocess_deadline = Instant::now() + Duration::from_millis(POSTPROCESS_LIMIT_MS);
         improve_by_boundary_signatures(&board, &mut best_orientation, postprocess_deadline);
-        let choices = build_multitile_choices(&board, &best_orientation);
-        resolve_multitile_choices(&board, &mut best_orientation, &choices);
         best_stats = board.evaluate(&best_orientation);
         emit_phase_snapshot(&board, "06_final_postprocess", &best_orientation);
     }
