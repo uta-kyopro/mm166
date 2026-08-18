@@ -704,6 +704,29 @@ Despite the smooth definition, the auxiliary did not improve final score.  At 9.
 
 - Three-run seed 1--10 averages for the retained local-transfer components were `5.175150` with all components, `5.174785` without adjacent shortcuts (`-0.084%` geometrically), `5.175108` without distance-two shortcuts (`-0.010%`), `5.172667` without triangle shortcuts (`-0.570%`), and `5.175119` without detached-loop merging (`-0.007%`). Keep all four enabled; triangle and adjacent shortcuts are clearly useful, while distance-two and loop merging are small but consistently nonnegative contributions in this comparison.
 
+### Heuristic rotation-cost multiplier
+
+- The final `Stats.score` kept the true rotation cost unchanged. Only non-final heuristic terms in route ranking, construction projections, compact SA, rotation-SA auxiliary energy, and local upper bounds used a multiplier on the rotation penalty. Three seed 1--10 averages were `5.174701` at `1.0x`, `5.174906` at `2.0x` (`+0.047%`), and `5.175220` at `0.5x` (`+0.120%`), but the larger paired seed 1--100 check reversed this: `1.0x=5.191867`, `0.5x=5.190000`, a `-0.429%` change for `0.5x` with 43 wins, 48 losses, and 9 ties. Retain `1.0x` for stability.
+- Lowering the multiplier further was harmful: three-run averages were `5.172494` at `0.25x` and `5.171561` at `0.1x`, both below the 0.5x trial. Do not reduce the heuristic rotation price further.
+
+### Priority from k-t-m correlation
+
+- With fixed connection count, `Delta S = k * (Delta t - M * Delta m)`: one rotation is exactly equivalent to `M` units of path value. Across the current 100-case analysis, `k` and `m` are positively correlated largely through board size, while `k` and `t` are globally positive but compete for wire resources within a board.
+- The practical priority is `preserve k -> transfer segments into high-multiplier paths -> reduce rotations when value is unchanged`. Dropping connections to save rotations is usually harmful on large boards; optimize `t - M*m` after holding `k` stable, with high-`M` bonus-heavy exceptions treated separately.
+
+### Independent rotation-objective branches
+
+- The existing 100-case logs gave `mean_log10(max(score_1.0, score_0.5)) - mean_log10(score_1.0) = +0.002630694`, or `+0.6076%` geometrically. This motivated a three-cycle portfolio using `1.0x/2.0x/0.5x` rotation prices on small and medium boards, with the construction archive supplying same-`k` starts and exact true score used for final selection.
+- The branch start was also registered as a best candidate, and the second construction-SA call now uses its own `best` as the branch fallback. Each branch's SA primary term is `k(t - branch_multiplier*M*m)`; the final `Stats.score` and large-board single cycle remain unchanged.
+- Three paired seed 1--10 runs scored `mean_log10=5.174759447` versus `5.174702214` for the 1.0x baseline, a geometric gain of only `+0.013%`. Failed cases stayed at 0 and average runtime was about 9.695s, so this is not yet a strong adoption result.
+
+### Bonus-gap weighted transfer
+
+- `low_bonus_reallocation` already shortened one matched route and then searched local extensions before comparing the complete transaction against the original state. Its old target gate only allowed up to `B/4` bonus tiles, so long `B-1` and `B-2` routes were excluded.
+- Expand targets to every partial-bonus route and rank them by `(B-b) * (length - expected_length)`. During the extension part, prefer an existing full-bonus route and fall back to the old general local extension if no improving full-bonus candidate is found. The original 0-bonus SA shortcut path is unchanged.
+- Three seed 1--10 runs scored `mean_log10=5.175412` versus `5.174702` for the retained baseline, about `+0.163%` geometrically, with 7 wins, 1 tie, 2 losses. Accepted diagnostics included a `B-1` victim shortened `1657->28` with local score delta `+132804`.
+- On the final strict-score version, seed 1--100 scored `mean_log10=5.192420753` versus `5.191396635` for the baseline, a geometric gain of `+0.236%`, with 43 wins, 40 losses, and 17 ties. Failed cases were 0; average runtime was 9.687s and maximum runtime 9.759s. Keep the transfer branch and investigate donor-to-nearby-full-hero coupling next.
+
 ### compact SA温度の再調整
 
 - 区間短絡近傍を統合した現行版で、seed 1〜10を`2e6→100`（基準）、`1e6→100`、`3e6→100`、`4e6→100`、`2e6→1000`で比較した。`mean_log10`は順に`5.176269`, `5.175114`, `5.175891`, `5.175999`, `5.175017`。低い開始温度と高い終了温度はそれぞれ幾何平均`-0.266%`, `-0.288%`で明確に悪化した。

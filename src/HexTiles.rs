@@ -63,6 +63,7 @@ const MULTITILE_CHOICE_LIMIT: usize = 24;
 const COMPACT_REPRESENTATIVES: usize = 1;
 const COMPACT_SA_START_TEMP: f64 = 2_000_000.0;
 const COMPACT_SA_END_TEMP: f64 = 100.0;
+const HEURISTIC_ROTATION_COST_MULTIPLIER: f64 = 1.0;
 const COMPACT_SEGMENT_INTERVAL_MS: u64 = 80;
 const MULTI_TRUNK_LNS_HEROES: usize = 2;
 const MULTI_TRUNK_LNS_VICTIMS: usize = 4;
@@ -489,6 +490,11 @@ const fn rotation_cost(from: u8, to: u8) -> i32 {
         [1, 2, 3, 2, 1, 0],
     ];
     TABLE[from as usize][to as usize]
+}
+
+#[inline]
+fn heuristic_rotation_penalty(board_m: i64, moves: i64) -> i64 {
+    (board_m as f64 * HEURISTIC_ROTATION_COST_MULTIPLIER * moves as f64).round() as i64
 }
 
 const fn build_best_domain_orientations() -> [[[u8; 64]; 6]; 6] {
@@ -1054,6 +1060,7 @@ fn route_rank(
     damage: Option<&DamageModel>,
 ) -> i64 {
     let heuristic = hex_cell_distance(board.W, node.cell, target_cell) as i64;
+    let rotation_penalty = heuristic_rotation_penalty(board.M as i64, node.rotations as i64);
     if special {
         // Length and bonuses reinforce one another. A small target heuristic keeps
         // the beam capable of closing after taking a profitable detour.  Once the
@@ -1062,10 +1069,11 @@ fn route_rank(
         let intrinsic = (node.length * (node.bonuses + 1)) as i64;
         let predicted_gain = if let Some(model) = damage {
             let (lost_k, lost_t) = damage_loss(model, node.damaged);
-            let old_q = model.base.total - board.M as i64 * model.base.moves as i64;
+            let old_q = model.base.total
+                - heuristic_rotation_penalty(board.M as i64, model.base.moves as i64);
             let new_k = model.base.matched.saturating_sub(lost_k) + 1;
             let delta_k = new_k as i64 - model.base.matched as i64;
-            let delta_q = intrinsic - lost_t - board.M as i64 * node.rotations as i64;
+            let delta_q = intrinsic - lost_t - rotation_penalty;
             delta_k * old_q + new_k as i64 * delta_q
         } else {
             0
@@ -1074,13 +1082,13 @@ fn route_rank(
             40 * predicted_gain + 80 * intrinsic
         } else {
             180 * intrinsic
-        }) - 12 * board.M as i64 * node.rotations as i64
+        }) - 12 * rotation_penalty
             - 5 * heuristic
             - node.depth_sum as i64
     } else {
         let overflow = board.boundary_depth[node.cell].saturating_sub(width);
         -(24 * node.length as i64
-            + 10 * board.M as i64 * node.rotations as i64
+            + 10 * rotation_penalty
             + 30 * node.depth_sum as i64
             + NORMAL_BONUS_PENALTY * node.bonuses as i64
             + 220 * (overflow * overflow) as i64
@@ -1349,10 +1357,13 @@ fn find_routes_between_ports_with_reverse_scratch(
                     let value = if special {
                         let n = &arena[nid];
                         (n.length * (n.bonuses + 1)) as i64
-                            - board.M as i64 * n.rotations as i64
+                            - heuristic_rotation_penalty(board.M as i64, n.rotations as i64)
                     } else {
                         -((arena[nid].length + arena[nid].depth_sum) as i64)
-                            - board.M as i64 * arena[nid].rotations as i64
+                            - heuristic_rotation_penalty(
+                                board.M as i64,
+                                arena[nid].rotations as i64,
+                            )
                     };
                     goals.push((value, nid));
                 } else if let Some((nc, ne)) = board.next(cell, out) {
@@ -1761,7 +1772,10 @@ fn estimate_connection_target(
                     && entry.stats.total as f64 >= BEAM_MOVE_MATURITY_RATIO * total_value
             })
             .map_or(estimated_moves, |entry| entry.stats.moves as f64);
-        let score = matched as f64 * (total_value - board.M as f64 * candidate_moves);
+        let score = matched as f64
+            * (total_value
+                - heuristic_rotation_penalty(board.M as i64, candidate_moves.round() as i64)
+                    as f64);
         (score.max(0.0), bonus_length, total_value, candidate_moves)
     };
     let (base_score, base_bonus_length, base_total, base_moves) =
@@ -2979,7 +2993,8 @@ fn run_tree_board_beam(
                 / PROJECTED_ROTATION_DEN;
         let projected_total = stats.total + projected_extra;
         let projected_score = (stats.matched as i64
-            * (projected_total - board.M as i64 * projected_moves as i64))
+            * (projected_total
+                - heuristic_rotation_penalty(board.M as i64, projected_moves as i64)))
             .max(0);
         scored.push((
             candidate.clone(),
@@ -3168,8 +3183,9 @@ fn polish(board: &Board, orientation: &mut Vec<u8>, deadline: Instant) {
                     &mut scratch,
                     &mut updates,
                 );
-                let q = s.total - board.M as i64 * s.moves as i64;
-                let best_q = best.total - board.M as i64 * best.moves as i64;
+                let q = s.total - heuristic_rotation_penalty(board.M as i64, s.moves as i64);
+                let best_q =
+                    best.total - heuristic_rotation_penalty(board.M as i64, best.moves as i64);
                 if (s.score, q, s.matched, s.total, Reverse(s.moves))
                     > (
                         best.score,
@@ -3293,13 +3309,19 @@ fn local_extend_candidate(
     rng: &mut Rng,
     workspace: &mut LocalExtendWorkspace,
     deadline: Instant,
+    required_bonus: Option<usize>,
 ) -> Option<(Stats, Vec<u8>)> {
     workspace.ranked.clear();
     workspace.ranked.extend(
         (0..board.pairs.len()).filter_map(|id| {
             let value = differential.contribution[id];
             let length = differential.pair_cells[id].len();
-            (value > 0 && length >= 2).then_some((value, id, length))
+            (value > 0
+                && length >= 2
+                && required_bonus.map_or(true, |bonus| {
+                    value / length as i64 == bonus as i64 + 1
+                }))
+            .then_some((value, id, length))
         }),
     );
     if workspace.ranked.is_empty() {
@@ -3419,7 +3441,10 @@ fn local_extend_candidate(
             let value = length * (bonuses + 1);
             let net_gain = value as i64
                 - old_value
-                - board.M as i64 * (rotations - old_rotations) as i64;
+                - heuristic_rotation_penalty(
+                    board.M as i64,
+                    (rotations - old_rotations) as i64,
+                );
             candidates.push((net_gain, value, rotations, pattern));
         }
         for &cell in &cells {
@@ -3471,7 +3496,7 @@ fn low_bonus_reallocation(
     let mut scratch = EvalScratch::new(board.valid.len());
     let initial = board.evaluate_with_scratch(orientation, &mut scratch);
     let initial_differential = DifferentialEval::new(board, orientation, &mut scratch);
-    let bonus_limit = board.bonus.iter().filter(|&&x| x).count() / 4;
+    let total_bonus_count = board.bonus.iter().filter(|&&x| x).count();
     let mut targets = Vec::new();
     for id in 0..board.pairs.len() {
         let value = initial_differential.contribution[id];
@@ -3480,17 +3505,19 @@ fn low_bonus_reallocation(
             continue;
         }
         let bonuses = value as usize / length - 1;
-        if bonuses > bonus_limit {
+        if bonuses >= total_bonus_count {
             continue;
         }
         let pair = board.pairs[id];
         let expected = expected_route_length_between_exits(board, pair[0], pair[1]);
         let excess = length as f64 - expected;
         if excess >= 1.5 {
-            targets.push(((excess * 1024.0) as usize, length, bonuses, id));
+            let bonus_gap = total_bonus_count - bonuses;
+            let priority = (bonus_gap as f64 * excess * 1024.0) as usize;
+            targets.push((priority, length, bonuses, bonus_gap, id));
         }
     }
-    targets.sort_unstable_by_key(|x| (Reverse(x.0), Reverse(x.1), x.2, x.3));
+    targets.sort_unstable_by_key(|x| (Reverse(x.0), Reverse(x.1), x.2, x.4));
     targets.truncate(LOW_BONUS_REALLOCATION_TARGETS);
     let jobs = targets.len();
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ initial.score as u64);
@@ -3504,7 +3531,7 @@ fn low_bonus_reallocation(
     let route_phase_deadline =
         (start + Duration::from_millis(10 * jobs as u64)).min(deadline);
     let mut shortened_jobs = Vec::with_capacity(jobs);
-    for &(_, old_length, bonuses, target_id) in &targets {
+    for &(_, old_length, bonuses, bonus_gap, target_id) in &targets {
         let now = Instant::now();
         if now >= route_phase_deadline {
             break;
@@ -3556,11 +3583,11 @@ fn low_bonus_reallocation(
         }
         let new_length = route.length;
         apply_route(&mut work, &mut domains, &route, true);
-        shortened_jobs.push((old_length, new_length, bonuses, target_id, work));
+        shortened_jobs.push((old_length, new_length, bonuses, bonus_gap, target_id, work));
     }
     let completed = shortened_jobs.len();
     let completed_jobs = shortened_jobs.len();
-    for (index, (old_length, new_length, bonuses, target_id, mut work)) in
+    for (index, (old_length, new_length, bonuses, bonus_gap, target_id, mut work)) in
         shortened_jobs.into_iter().enumerate()
     {
         let now = Instant::now();
@@ -3576,7 +3603,7 @@ fn low_bonus_reallocation(
             let step_deadline =
                 (Instant::now() + Duration::from_millis(LOW_BONUS_REALLOCATION_STEP_MS))
                     .min(job_deadline);
-            let Some((stats, candidate)) = local_extend_candidate(
+            let full_bonus_candidate = local_extend_candidate(
                 board,
                 &work,
                 work_stats,
@@ -3584,7 +3611,21 @@ fn low_bonus_reallocation(
                 &mut rng,
                 &mut local_workspace,
                 step_deadline,
-            ) else {
+                Some(total_bonus_count),
+            )
+            .filter(|(stats, _)| stats.quality() > work_stats.quality());
+            let Some((stats, candidate)) = full_bonus_candidate.or_else(|| {
+                local_extend_candidate(
+                    board,
+                    &work,
+                    work_stats,
+                    &work_differential,
+                    &mut rng,
+                    &mut local_workspace,
+                    step_deadline,
+                    None,
+                )
+            }) else {
                 continue;
             };
             if stats.quality() > work_stats.quality() {
@@ -3595,15 +3636,20 @@ fn low_bonus_reallocation(
             }
         }
         let target_connected = board.trace_pair(&work, target_id, &mut scratch, None).0 > 0;
-        if target_connected && work_stats.matched >= initial.matched && board.tester_safe(&work) {
-            positive += usize::from(work_stats.score > initial.score);
-            if work_stats.quality() > best.quality() {
+        if target_connected
+            && work_stats.matched >= initial.matched
+            && work_stats.score > initial.score
+            && board.tester_safe(&work)
+        {
+            positive += 1;
+            if work_stats.score > best.score {
                 best = work_stats;
                 best_orientation = work;
                 eprintln!(
-                    "low_bonus_reallocation_improve id={} bonus={} length={}->{} score_delta={}",
+                    "bonus_gap_transfer_accept id={} bonus={} gap={} length={}->{} score_delta={}",
                     target_id,
                     bonuses,
+                    bonus_gap,
                     old_length,
                     new_length,
                     best.score - initial.score
@@ -3611,11 +3657,11 @@ fn low_bonus_reallocation(
             }
         }
     }
-    if best.quality() > initial.quality() {
+    if best.score > initial.score {
         orientation.clone_from(&best_orientation);
     }
     eprintln!(
-        "low_bonus_reallocation targets={} completed={} positive={} extensions={}/{} score_delta={} elapsed_ms={}",
+        "bonus_gap_transfer targets={} completed={} positive={} extensions={}/{} score_delta={} elapsed_ms={}",
         jobs,
         completed,
         positive,
@@ -4633,7 +4679,7 @@ fn compact_metrics(
     let energy = matched as i64 * 1_000_000_000 + representative_value * 10_000
         - compressible_length as i64 * 200
         - unmatched_length as i64 * 300
-        - board.M as i64 * moves as i64 * 200;
+        - heuristic_rotation_penalty(board.M as i64, moves as i64) * 200;
     CompactMetrics {
         energy,
         matched,
@@ -5593,7 +5639,8 @@ fn try_merge_detached_loop(
                     let predicted_total =
                         proposed.total + loop_length as i64 * (bonuses + 1);
                     let predicted_score = (proposed.matched as i64
-                        * (predicted_total - board.M as i64 * predicted_moves as i64))
+                        * (predicted_total
+                            - heuristic_rotation_penalty(board.M as i64, predicted_moves as i64)))
                         .max(0);
                     if predicted_score <= best_score {
                         continue;
@@ -5892,7 +5939,10 @@ fn search_rotations(
                         .unwrap_or(0);
                     let merge_upper_score = (next.matched as i64
                         * (next.total + released_length * max_bonus_multiplier
-                            - board.M as i64 * (next.moves - 3).max(0) as i64))
+                            - heuristic_rotation_penalty(
+                                board.M as i64,
+                                (next.moves - 3).max(0) as i64,
+                            )))
                         .max(0);
                     if released_length > 0
                         && max_bonus_multiplier > 1
@@ -6005,6 +6055,7 @@ fn search_rotations(
                 &mut rng,
                 &mut local_workspace,
                 local_deadline,
+                None,
             )
             {
                 let next_differential = DifferentialEval::new(board, &candidate, &mut eval_scratch);
@@ -7576,7 +7627,10 @@ fn search_path_reallocation(board: &Board, orientation: &mut Vec<u8>, deadline: 
         (portfolio_start + Duration::from_millis(PATH_REALLOCATION_MS)).min(deadline);
     let before_reallocation = board.evaluate(orientation);
     let use_compact_only = board.valid_count <= 80
-        && 5 * board.M as i64 * before_reallocation.moves as i64 > before_reallocation.total;
+        && 5 * heuristic_rotation_penalty(
+            board.M as i64,
+            before_reallocation.moves as i64,
+        ) > before_reallocation.total;
     eprintln!(
         "reallocation_branch kind={} cells={} penalty_ratio={:.4}",
         if use_compact_only {
@@ -7585,7 +7639,9 @@ fn search_path_reallocation(board: &Board, orientation: &mut Vec<u8>, deadline: 
             "portfolio"
         },
         board.valid_count,
-        board.M as f64 * before_reallocation.moves as f64
+        HEURISTIC_ROTATION_COST_MULTIPLIER
+            * board.M as f64
+            * before_reallocation.moves as f64
             / before_reallocation.total.max(1) as f64
     );
     if use_compact_only {
